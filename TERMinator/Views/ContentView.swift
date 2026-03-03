@@ -126,7 +126,7 @@ struct AboutView: View {
                         Text("GitHub: ")
                             .aboutText()
                         aboutLink("github.com/omniphil/TERMinator-macOS",
-                                  url: "https://github.com/omniphil/TERMinator-MacOS")
+                                  url: "https://github.com/omniphil/TERMinator-macOS")
                     }
                 }
                 .padding(16)
