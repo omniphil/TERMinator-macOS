@@ -1,0 +1,100 @@
+name: TERMinator
+options:
+  bundleIdPrefix: com.terminator
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ARCHS: arm64
+    SWIFT_VERSION: "5.9"
+    CLANG_ENABLE_MODULES: YES
+    CLANG_ENABLE_OBJC_ARC: YES
+
+targets:
+  TERMinator:
+    type: application
+    platform: macOS
+    sources:
+      # Swift sources
+      - path: TERMinator
+        excludes:
+          # Exclude iOS-variant C files (we use macos_* variants instead)
+          - "Bridge/ios_ciolib.c"
+          - "Bridge/ios_ciolib.h"
+          - "Bridge/ios_stubs.c"
+          - "Bridge/syncterm_ios.c"
+          - "Bridge/modplayer_ios.c"
+          - "Bridge/zmodem_ios.c"
+          - "Bridge/zmodem_ios.h"
+          # Exclude legacy prowizard depackers (reference undefined globals)
+          - "Bridge/libxmp/loaders/prowizard/*.c"
+          # Exclude static libraries from source compilation
+          - "Bridge/cryptlib/ios-arm64/**"
+          - "Bridge/cryptlib/ios-simulator-arm64/**"
+          - "Bridge/cryptlib/macos-arm64/**"
+        compilerFlags:
+          # C files need __unix__ defined
+          - path: "Bridge/**/*.c"
+            flags: "-w"  # Suppress warnings in third-party C code
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.terminator.macos
+        PRODUCT_NAME: TERMinator
+        INFOPLIST_FILE: TERMinator/Info.plist
+        CODE_SIGN_ENTITLEMENTS: TERMinator/TERMinator.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SWIFT_OBJC_BRIDGING_HEADER: TERMinator/TERMinator-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/TERMinator/Bridge"
+          - "$(SRCROOT)/TERMinator/Bridge/conio"
+          - "$(SRCROOT)/TERMinator/Bridge/xpdev"
+          - "$(SRCROOT)/TERMinator/Bridge/syncterm"
+          - "$(SRCROOT)/TERMinator/Bridge/sbbs3"
+          - "$(SRCROOT)/TERMinator/Bridge/encode"
+          - "$(SRCROOT)/TERMinator/Bridge/uifc"
+          - "$(SRCROOT)/TERMinator/Bridge/sftp"
+          - "$(SRCROOT)/TERMinator/Bridge/libxmp"
+          - "$(SRCROOT)/TERMinator/Bridge/cryptlib/include"
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - "__unix__=1"
+          - "LIBXMP_NO_PROWIZARD=1"
+          - "$(inherited)"
+        # Suppress warnings in C bridge code
+        OTHER_CFLAGS:
+          - "-w"
+          - "$(inherited)"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/TERMinator/Bridge/cryptlib/macos-arm64"
+        OTHER_LDFLAGS:
+          - "-lcl"
+          - "$(inherited)"
+        ENABLE_HARDENED_RUNTIME: YES
+        COMBINE_HIDPI_IMAGES: YES
+      debug:
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - "DEBUG=1"
+          - "__unix__=1"
+          - "LIBXMP_NO_PROWIZARD=1"
+          - "$(inherited)"
+      release:
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - "__unix__=1"
+          - "LIBXMP_NO_PROWIZARD=1"
+          - "$(inherited)"
+
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: Security.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVKit.framework
+      # cryptlib static library is linked via LIBRARY_SEARCH_PATHS and OTHER_LDFLAGS above
+
+    preBuildScripts: []
+    postBuildScripts: []

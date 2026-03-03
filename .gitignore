@@ -1,0 +1,46 @@
+# Xcode build
+build/
+DerivedData/
+*.xcarchive
+
+# Xcode user-specific
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# IDE / tool metadata
+.idea/
+.vscode/
+.claude/
+
+# Generated Xcode project (regenerate via xcodegen)
+TERMinator.xcodeproj/
+
+# CocoaPods / SPM
+Pods/
+.build/
+
+# Signing / Certificates
+*.p12
+*.cer
+*.mobileprovision
+*.certSigningRequest
+
+# Build outputs
+*.ipa
+*.app
+*.dmg
+
+# Environment
+.env
+*.env
+
+# Backup files
+*.backup
+
+# Temp files
+*.tmp.*
