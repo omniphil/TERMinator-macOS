@@ -2,6 +2,9 @@
 build/
 DerivedData/
 *.xcarchive
+*.dSYM
+*.dSYM.zip
+*.hmap
 
 # Xcode user-specific
 *.xcuserstate
@@ -23,6 +26,8 @@ TERMinator.xcodeproj/
 # CocoaPods / SPM
 Pods/
 .build/
+.swiftpm/
+Packages/
 
 # Signing / Certificates
 *.p12
@@ -44,3 +49,6 @@ Pods/
 
 # Temp files
 *.tmp.*
+
+# Merge conflict backups
+*.orig
