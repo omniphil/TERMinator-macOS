@@ -15,9 +15,69 @@
 #include <unistd.h>
 
 #include "gen_defs.h"
+#include "bbslist.h"
 
 // Forward declarations for iOS-specific functions
 extern const char* ios_get_documents_directory(void);
+
+// g_bbs_config is defined in syncterm_macos.c — used by uifcinput to supply credentials
+extern struct bbslist g_bbs_config;
+
+// ============================================================================
+// SSH Debug Log — ring buffer visible to Swift via native_get_ssh_debug_log
+// ============================================================================
+#define SSH_DEBUG_LOG_SIZE 16384
+static char g_ssh_debug_log[SSH_DEBUG_LOG_SIZE];
+static int  g_ssh_debug_log_len = 0;
+static pthread_mutex_t g_ssh_debug_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Append a formatted message to the SSH debug log (thread-safe). */
+void ssh_debug_log(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+
+    pthread_mutex_lock(&g_ssh_debug_lock);
+    int avail = SSH_DEBUG_LOG_SIZE - 1 - g_ssh_debug_log_len;
+    if (n > avail) n = avail;
+    if (n > 0) {
+        memcpy(g_ssh_debug_log + g_ssh_debug_log_len, buf, n);
+        g_ssh_debug_log_len += n;
+        g_ssh_debug_log[g_ssh_debug_log_len] = '\0';
+    }
+    pthread_mutex_unlock(&g_ssh_debug_lock);
+}
+
+/* Retrieve the accumulated SSH debug log. Returns bytes written. */
+int ssh_debug_get_log(char *buf, int buflen) {
+    if (!buf || buflen <= 0) return 0;
+    pthread_mutex_lock(&g_ssh_debug_lock);
+    int copy = g_ssh_debug_log_len;
+    if (copy >= buflen) copy = buflen - 1;
+    if (copy > 0) memcpy(buf, g_ssh_debug_log, copy);
+    buf[copy] = '\0';
+    pthread_mutex_unlock(&g_ssh_debug_lock);
+    return copy;
+}
+
+/* Clear the SSH debug log. */
+void ssh_debug_clear_log(void) {
+    pthread_mutex_lock(&g_ssh_debug_lock);
+    g_ssh_debug_log_len = 0;
+    g_ssh_debug_log[0] = '\0';
+    pthread_mutex_unlock(&g_ssh_debug_lock);
+}
+
+/* Reset password retry counter (called before each new connection attempt). */
+static int g_password_retry_count = 0;
+#define MAX_PASSWORD_RETRIES 2
+
+void ssh_debug_reset_retry_count(void) {
+    g_password_retry_count = 0;
+}
 
 // ============================================================================
 // File Path Functions
@@ -79,17 +139,47 @@ char *get_syncterm_filename(char *fn, int fnlen, int type, bool shared) {
 // These are called by SyncTERM but we handle UI differently on iOS
 
 int uifcmsg(const char *msg, const char *helptext) {
-    (void)helptext;
-    printf("[SyncTERM] Message: %s\n", msg ? msg : "(null)");
+    if (msg) {
+        printf("[SyncTERM] Message: %s\n", msg);
+        ssh_debug_log("[uifcmsg] %s\n", msg);
+    }
+    if (helptext && helptext[0]) {
+        ssh_debug_log("[uifcmsg detail] %s\n", helptext);
+    }
     return 0;
 }
 
 int uifcinput(const char *title, int maxlen, char *buf, int mode, const char *help) {
-    (void)title;
-    (void)maxlen;
-    (void)buf;
     (void)mode;
     (void)help;
+    // Provide credentials from g_bbs_config so SSH connections don't try
+    // to prompt interactively (there is no UI to prompt from in bridge mode).
+    if (title && buf && maxlen > 0) {
+        if (strcmp(title, "UserID") == 0 && g_bbs_config.user[0] != '\0') {
+            strncpy(buf, g_bbs_config.user, maxlen);
+            buf[maxlen - 1] = '\0';
+            ssh_debug_log("[auth] Username provided: %s\n", buf);
+            return (int)strlen(buf);
+        }
+        if (strcmp(title, "Password") == 0) {
+            if (g_password_retry_count >= MAX_PASSWORD_RETRIES) {
+                ssh_debug_log("[auth] ERROR: Max password retries (%d) reached, aborting\n",
+                              MAX_PASSWORD_RETRIES);
+                g_password_retry_count = 0;
+                return -1;
+            }
+            if (g_bbs_config.password[0] != '\0') {
+                strncpy(buf, g_bbs_config.password, maxlen);
+                buf[maxlen - 1] = '\0';
+                g_password_retry_count++;
+                ssh_debug_log("[auth] Password provided (attempt %d, length=%zu)\n",
+                              g_password_retry_count, strlen(buf));
+                return (int)strlen(buf);
+            }
+            ssh_debug_log("[auth] No password available for prompt\n");
+        }
+    }
+    ssh_debug_log("[auth] uifcinput cancelled for title='%s'\n", title ? title : "(null)");
     return -1;  // Cancelled
 }
 
@@ -401,14 +491,26 @@ const char *telnet_opt_desc(int opt) {
     return buf;
 }
 
-const char *telnet_opt_ack(int opt) {
-    (void)opt;
-    return "ACK";
+// Acknowledge a telnet option: DO↔WILL, DONT↔WONT
+unsigned char telnet_opt_ack(unsigned char cmd) {
+    switch (cmd) {
+        case 253: return 251;  // DO   → WILL
+        case 254: return 252;  // DONT → WONT
+        case 251: return 253;  // WILL → DO
+        case 252: return 254;  // WONT → DONT
+        default:  return cmd;
+    }
 }
 
-const char *telnet_opt_nak(int opt) {
-    (void)opt;
-    return "NAK";
+// Negative-acknowledge a telnet option: DO→WONT, WILL→DONT
+unsigned char telnet_opt_nak(unsigned char cmd) {
+    switch (cmd) {
+        case 253: return 252;  // DO   → WONT
+        case 254: return 252;  // DONT → WONT (already negative)
+        case 251: return 254;  // WILL → DONT
+        case 252: return 254;  // WONT → DONT (already negative)
+        default:  return cmd;
+    }
 }
 
 // ============================================================================
@@ -417,14 +519,34 @@ const char *telnet_opt_nak(int opt) {
 
 #include "cterm.h"
 
-const char *get_emulation_str(struct bbslist *bbs) {
-    (void)bbs;
-    return "ANSI-BBS";
+/* Mirrors bbslist.c's get_emulation(): the screen mode decides the emulation.
+ * macOS only offers the Commodore modes besides ANSI (see native_set_screen_mode). */
+cterm_emulation_t get_emulation(struct bbslist *bbs) {
+    if (!bbs)
+        return CTERM_EMULATION_ANSI_BBS;
+    switch (bbs->screen_mode) {
+        case SCREEN_MODE_C64:
+        case SCREEN_MODE_C128_40:
+        case SCREEN_MODE_C128_80:
+            return CTERM_EMULATION_PETASCII;
+        default:
+            return CTERM_EMULATION_ANSI_BBS;
+    }
 }
 
-cterm_emulation_t get_emulation(struct bbslist *bbs) {
-    (void)bbs;
-    return CTERM_EMULATION_ANSI_BBS;
+/* Telnet TTYPE: the entry's terminal name if set, else SyncTERM's per-emulation name —
+ * bbslist.c's get_emulation_str(), as Windows and ssh.c already send. */
+const char *get_emulation_str(struct bbslist *bbs) {
+    if (bbs && bbs->term_name[0])
+        return bbs->term_name;
+
+    switch (get_emulation(bbs)) {
+        case CTERM_EMULATION_PETASCII:
+            return "PETSCII";
+        case CTERM_EMULATION_ANSI_BBS:
+        default:
+            return "syncterm";
+    }
 }
 
 // ============================================================================
@@ -451,11 +573,90 @@ void ciolib_freepixels(struct ciolib_pixels *pixels) {
     // No-op
 }
 
-// Custom cursor - not supported on iOS
+// Custom cursor — matches bitmap_getcustomcursor/bitmap_setcustomcursor from bitmap_con.c
 void ciolib_getcustomcursor(int *startline, int *endline, int *range, int *blink, int *visible) {
-    if (startline) *startline = 0;
-    if (endline) *endline = 0;
-    if (range) *range = 0;
-    if (blink) *blink = 1;
-    if (visible) *visible = 1;
+    if (startline) *startline = macos_ciolib_get_cursor_start();
+    if (endline) *endline = macos_ciolib_get_cursor_end();
+    if (range) {
+        int h = macos_ciolib_get_char_pixel_height();
+        *range = h > 0 ? h : 16;
+    }
+    if (blink) *blink = macos_ciolib_get_cursor_blinks();
+    if (visible) *visible = macos_ciolib_is_cursor_visible();
+}
+
+void ciolib_setcustomcursor(int startline, int endline, int range, int blink, int visible) {
+    macos_ciolib_set_custom_cursor(startline, endline, range, blink, visible);
+}
+
+// ---------------------------------------------------------------------------
+// macOS MIGRATION 2026-09-04 — ciolib functions required by the real cterm.c
+// engine (USE_REAL_CTERM, see Bridge/cterm_mode.h).
+//
+// Ported verbatim from the shipping iOS build's ios_stubs.c, which took them
+// from Android's android_stubs.c / android_ciolib.c. They complete the canvas
+// API surface cterm.c expects. Harmless if the legacy parser is active — they
+// are simply never called — so they do NOT need to be removed on a rollback.
+// ---------------------------------------------------------------------------
+
+// Write a string one character at a time via ciolib_putch (matches Android).
+int ciolib_cputs(const char *str) {
+    extern int ciolib_putch(int);
+    if (!str) return 0;
+    int count = 0;
+    while (*str) {
+        ciolib_putch((unsigned char)*str++);
+        count++;
+    }
+    return count;
+}
+
+// Pack an RGB triple (16-bit components) into a ciolib RGB color value.
+uint32_t ciolib_map_rgb(uint16_t r, uint16_t g, uint16_t b) {
+    return CIOLIB_COLOR_RGB | ((uint32_t)(r >> 8) << 16)
+                            | ((uint32_t)(g >> 8) << 8)
+                            |  (uint32_t)(b >> 8);
+}
+
+// Board-loaded fonts (CTerm:Font DCS / CSI = n;m{ upload), bitmap_con.c's bitmap_replace_font().
+// Only the free slots may be replaced; cterm hands over malloc'd name and data, owned from here.
+// The renderer picks the glyphs up through native_get_font_bitmap() once the slot is selected.
+extern struct conio_font_data_struct conio_fontdata[257];
+
+void ciolib_replace_font(uint8_t id, char *name, void *data, size_t size) {
+    char **slot = NULL;
+
+    if (id >= CONIO_FIRST_FREE_FONT) {
+        switch (size) {
+            case 10240: slot = &conio_fontdata[id].twelve_by_twenty;  break;
+            case 4096:  slot = &conio_fontdata[id].eight_by_sixteen;  break;
+            case 3584:  slot = &conio_fontdata[id].eight_by_fourteen; break;
+            case 2048:  slot = &conio_fontdata[id].eight_by_eight;    break;
+            default:    break;
+        }
+    }
+    if (!slot) {
+        free(name);
+        free(data);
+        return;
+    }
+    free(*slot);
+    *slot = data;
+    free(conio_fontdata[id].desc);
+    conio_fontdata[id].desc = name;
+}
+
+/* ---------------------------------------------------------------------------
+ * macOS MIGRATION: xpbeep stubs.
+ *
+ * The real cterm engine (Bridge/conio/cterm.c) calls into xpdev's xpbeep for
+ * ANSI music and tone playback. macOS has no xpbeep.c — the plain BEL is
+ * handled separately by native_check_bell()/BellManager, so these are no-ops
+ * that just keep the link satisfied. ANSI music is silent in this build.
+ * ------------------------------------------------------------------------- */
+void xpbeep(double freq, uint32_t duration) {
+    (void)freq; (void)duration;
+}
+
+void xptone_complete(void) {
 }

@@ -2,86 +2,118 @@ import SwiftUI
 
 /// A vertically scrolling ticker showing computing history facts.
 /// Matches the Android/iOS HistoryTickerView with smooth vertical scrolling and crossfade.
+///
+/// Since the 1.1.0 layout overhaul the whole ticker area is clickable and opens the full
+/// facts list (`onOpenFacts`) instead of advancing; hovering shows a rounded amber outline,
+/// a faint amber tint and brighter text, with a "Click to see the full list" tooltip.
 struct HistoryTickerView: View {
+    /// Called when the ticker is clicked (HomeView opens the facts overlay).
+    var onOpenFacts: (() -> Void)? = nil
     var facts: [String] = HistoryFacts.all
-    var textColor: Color = .termLightGreen
-    var backgroundColor: Color = .background
+    var textColor: Color = .tickerGreen
+    var hoverTextColor: Color = .tickerGreenBright
+    var backgroundColor: Color = .clear
     var displayDuration: TimeInterval = 8.0
     var transitionDuration: TimeInterval = 1.0
+    /// Windows `HistoryTicker.ScrollToNext`: the old line slides up a full ticker height while
+    /// fading out, the new one slides up from a full height below, fully opaque (the clip hides
+    /// it until it enters). Linear, 1 s.
+    private let slideDistance: CGFloat = 48
 
     @State private var shuffledIndices: [Int] = []
     @State private var currentPosition: Int = 0
+    /// The two lines on screen, held as TEXT like Windows' CurrentText / NextText TextBlocks. They used
+    /// to be derived from `shuffledIndices[currentPosition]`, so the reshuffle at the end of a cycle
+    /// (which happens as a slide starts) swapped the outgoing line mid-slide. Now a line only changes
+    /// at a slide boundary.
+    @State private var currentText: String = ""
+    @State private var nextText: String = ""
     @State private var currentOpacity: Double = 1.0
     @State private var nextOpacity: Double = 0.0
     @State private var currentOffset: CGFloat = 0
-    @State private var nextOffset: CGFloat = 20
+    @State private var nextOffset: CGFloat = 48
     @State private var timer: Timer?
     @State private var isAnimating: Bool = false
+    @State private var isHovered: Bool = false
 
     var body: some View {
         ZStack {
             backgroundColor
 
             ZStack {
-                factText(currentFact)
+                factText(currentText)
                     .opacity(currentOpacity)
                     .offset(y: currentOffset)
 
-                factText(nextFact)
+                factText(nextText)
                     .opacity(nextOpacity)
                     .offset(y: nextOffset)
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
         }
-        .frame(height: 60)
+        .frame(height: 48)
         .clipped()
+        // Hover frame: the same amber cue as the clickable tiles. The fill also makes the
+        // gaps between lines clickable, not just the glyphs.
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isHovered ? Color.amberAccent.opacity(0.08) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(isHovered ? Color.amberAccent.opacity(0.6) : Color.clear, lineWidth: 1)
+        )
         .contentShape(Rectangle())
         .onTapGesture {
-            skipToNext()
+            onOpenFacts?()
         }
+        .onHover { hovering in
+            guard hovering != isHovered else { return }   // exactly one pop per push
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .retroTooltip("Click to see the full list")
         .onAppear {
             startTicker()
         }
         .onDisappear {
             stopTicker()
+            // Leaving the home screen while the pointer is on the ticker sends no exit event,
+            // which would leave the hand cursor stuck.
+            if isHovered {
+                isHovered = false
+                NSCursor.pop()
+            }
         }
     }
 
-    private func skipToNext() {
-        guard !isAnimating else { return }
-        timer?.invalidate()
-        transitionToNext()
-        timer = Timer.scheduledTimer(withTimeInterval: displayDuration, repeats: true) { _ in
-            transitionToNext()
-        }
-    }
-
-    private var currentFact: String {
-        guard !shuffledIndices.isEmpty else { return "" }
-        let index = shuffledIndices[currentPosition % shuffledIndices.count]
-        return facts[safe: index] ?? ""
-    }
-
-    private var nextFact: String {
-        guard !shuffledIndices.isEmpty else { return "" }
-        let nextPos = (currentPosition + 1) % shuffledIndices.count
-        let index = shuffledIndices[nextPos]
-        return facts[safe: index] ?? ""
+    private func fact(at position: Int) -> String {
+        guard position >= 0, position < shuffledIndices.count else { return "" }
+        return facts[safe: shuffledIndices[position]] ?? ""
     }
 
     private func factText(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 13, weight: .medium, design: .monospaced))
-            .foregroundColor(textColor)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundColor(isHovered ? hoverTextColor : textColor)
             .multilineTextAlignment(.center)
             .lineLimit(2)
             .frame(maxWidth: .infinity)
     }
 
     private func startTicker() {
-        guard facts.count > 1 else { return }
+        guard !facts.isEmpty else { return }
         shuffleIndices()
         currentPosition = 0
+        currentText = fact(at: 0)
+        nextText = ""
+        currentOpacity = 1
+        currentOffset = 0
+        nextOpacity = 0
+        nextOffset = slideDistance
+        guard facts.count > 1 else { return }
+        timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: displayDuration, repeats: true) { _ in
             transitionToNext()
         }
@@ -100,24 +132,42 @@ struct HistoryTickerView: View {
         guard !isAnimating else { return }
         isAnimating = true
 
-        let nextPosition = currentPosition + 1
+        // Windows ScrollToNext: advance, reshuffling after the last fact, and load the incoming line
+        // BEFORE the slide. The outgoing line is already fixed in `currentText`.
+        var nextPosition = currentPosition + 1
         if nextPosition >= shuffledIndices.count {
             shuffleIndices()
+            nextPosition = 0
+        }
+        currentPosition = nextPosition
+
+        // Start positions (no animation): next line opaque, a full height below.
+        var reset = Transaction()
+        reset.disablesAnimations = true
+        withTransaction(reset) {
+            nextText = fact(at: nextPosition)
+            nextOpacity = 1
+            nextOffset = slideDistance
         }
 
-        withAnimation(.easeInOut(duration: transitionDuration)) {
+        withAnimation(.linear(duration: transitionDuration)) {
             currentOpacity = 0
-            currentOffset = -20
-            nextOpacity = 1
+            currentOffset = -slideDistance
             nextOffset = 0
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + transitionDuration) {
-            currentPosition = nextPosition >= shuffledIndices.count ? 0 : nextPosition
-            currentOpacity = 1
-            currentOffset = 0
-            nextOpacity = 0
-            nextOffset = 20
+            // Swap without animation, as Windows' Completed handler does: the incoming line becomes
+            // the current one exactly where it already sits.
+            var settle = Transaction()
+            settle.disablesAnimations = true
+            withTransaction(settle) {
+                currentText = nextText
+                currentOpacity = 1
+                currentOffset = 0
+                nextOpacity = 0
+                nextOffset = slideDistance
+            }
             isAnimating = false
         }
     }

@@ -11,6 +11,25 @@
 #   TEAM_ID    — Apple Developer Team ID
 #   APP_PASSWORD — App-specific password (or use @keychain:notarytool-password)
 #
+# ⚠️ Dropbox: BUILD_DIR sits inside the synced project folder, so the archive,
+# the export and the DMG all sync between both machines. When both machines
+# build, Dropbox resolves the clash by keeping ONE version under the real name
+# and renaming the other "... (conflicted copy <date>)" — and it does not
+# reliably keep the newer one. On 2026-08-27 that left build/export/TERMinator.app
+# holding the May 1.0.0 executable and Info.plist, with the freshly exported
+# 1.0.3 files sitting beside them as conflicted copies: a bundle that looks
+# fine, launches, and is the wrong build. Stop it syncing (run once, on the Mac):
+#
+#   xattr -w com.dropbox.ignored 1 "$(dirname "$0")/../build"
+#
+# build/ is already in .gitignore, so nothing needs it synced.
+#
+# If a conflict has already happened, do NOT cherry-pick files — the bundle is
+# only valid if every file comes from the same export. Delete build/export and
+# re-run, then confirm with:
+#   codesign --verify --deep --strict --verbose=2 build/export/TERMinator.app
+#   stapler validate build/export/TERMinator.app
+#
 
 set -euo pipefail
 
@@ -68,23 +87,33 @@ ok "Signing identity: ${SIGNING_IDENTITY}"
 # ── Collect credentials ──────────────────────────────────────────────────────
 
 if [[ "$SKIP_NOTARIZE" == false ]]; then
-    if [[ -z "${APPLE_ID:-}" ]]; then
-        printf "Apple ID (email): "
-        read -r APPLE_ID
-    fi
-    if [[ -z "${TEAM_ID:-}" ]]; then
-        printf "Team ID: "
-        read -r TEAM_ID
-    fi
-    if [[ -z "${APP_PASSWORD:-}" ]]; then
-        # Check if stored in keychain
-        if xcrun notarytool history --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --keychain-profile "notarytool-password" >/dev/null 2>&1; then
-            APP_PASSWORD="@keychain:notarytool-password"
-            info "Using keychain profile 'notarytool-password'"
-        else
-            printf "App-specific password (or store with: xcrun notarytool store-credentials): "
-            read -rs APP_PASSWORD
-            echo
+    # Try keychain profile first (no prompts needed)
+    if [[ -z "${APPLE_ID:-}" ]] && xcrun notarytool history --keychain-profile "notarytool-password" >/dev/null 2>&1; then
+        APP_PASSWORD="@keychain:notarytool-password"
+        info "Using keychain profile 'notarytool-password'"
+        # Still need TEAM_ID for ExportOptions.plist — extract from certificate
+        if [[ -z "${TEAM_ID:-}" ]]; then
+            TEAM_ID=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed -E 's/.*\(([A-Z0-9]+)\)"$/\1/' || true)
+            info "Using Team ID from certificate: ${TEAM_ID}"
+        fi
+    else
+        if [[ -z "${APPLE_ID:-}" ]]; then
+            printf "Apple ID (email): "
+            read -r APPLE_ID
+        fi
+        if [[ -z "${TEAM_ID:-}" ]]; then
+            printf "Team ID: "
+            read -r TEAM_ID
+        fi
+        if [[ -z "${APP_PASSWORD:-}" ]]; then
+            if xcrun notarytool history --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --keychain-profile "notarytool-password" >/dev/null 2>&1; then
+                APP_PASSWORD="@keychain:notarytool-password"
+                info "Using keychain profile 'notarytool-password'"
+            else
+                printf "App-specific password (or store with: xcrun notarytool store-credentials): "
+                read -rs APP_PASSWORD
+                echo
+            fi
         fi
     fi
 else
@@ -151,6 +180,48 @@ info "Verifying code signature..."
 codesign --verify --deep --strict "$APP_BUNDLE"
 ok "Code signature valid"
 
+# ── Step 2b: TRACE helper check ──────────────────────────────────────────────
+# The Xcode phase "Embed TRACE host" (scripts/embed-trace-host.sh) builds, embeds and signs the helper inside-out
+# (dylib, helper with TERMinator/gamesandbox.entitlements, then Xcode signs the app). -exportArchive re-signs nested
+# code; make sure that kept the helper's hardened runtime + entitlements (no --deep reliance), else re-sign here
+# inside-out and re-seal the app with its own entitlements preserved.
+
+TRACE_HELPER="${APP_BUNDLE}/Contents/Helpers/gamesandbox"
+TRACE_DYLIB="${APP_BUNDLE}/Contents/Frameworks/libwasmtime.dylib"
+TRACE_ENTITLEMENTS="${PROJECT_DIR}/TERMinator/gamesandbox.entitlements"
+
+trace_helper_ok() {
+    local ents flags key
+    ents=$(codesign -d --entitlements - "$TRACE_HELPER" 2>&1 || true)
+    flags=$(codesign -dvv "$TRACE_HELPER" 2>&1 || true)
+    for key in com.apple.security.app-sandbox com.apple.security.inherit \
+               com.apple.security.cs.allow-jit com.apple.security.cs.allow-unsigned-executable-memory; do
+        grep -q "$key" <<<"$ents" || { echo "  helper lacks $key"; return 1; }
+    done
+    grep -q "runtime" <<<"$flags" || { echo "  helper lacks the hardened runtime flag"; return 1; }
+    grep -q "Authority=Developer ID Application" <<<"$flags" || { echo "  helper isn't Developer ID signed"; return 1; }
+    codesign --verify --strict "$TRACE_DYLIB" || return 1
+    codesign --verify --strict "$TRACE_HELPER" || return 1
+    return 0
+}
+
+info "Checking the TRACE helper..."
+if [[ ! -x "$TRACE_HELPER" || ! -f "$TRACE_DYLIB" ]]; then
+    err "TRACE helper missing from ${APP_BUNDLE} (Contents/Helpers/gamesandbox + Contents/Frameworks/libwasmtime.dylib).
+    Doors would get wasm=0. Check the 'Embed TRACE host' phase in the archive log."
+fi
+if ! trace_helper_ok; then
+    info "Export changed the TRACE helper's signature; re-signing it inside-out..."
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$TRACE_DYLIB"
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
+             --entitlements "$TRACE_ENTITLEMENTS" "$TRACE_HELPER"
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
+             --preserve-metadata=entitlements,requirements,flags "$APP_BUNDLE"
+    trace_helper_ok || err "TRACE helper still not signed correctly after re-signing"
+    codesign --verify --deep --strict "$APP_BUNDLE"
+fi
+ok "TRACE helper signed: hardened runtime + sandbox inherit + allow-jit"
+
 # ── Step 3: Notarize the app ────────────────────────────────────────────────
 
 if [[ "$SKIP_NOTARIZE" == false ]]; then
@@ -159,16 +230,16 @@ if [[ "$SKIP_NOTARIZE" == false ]]; then
     ditto -c -k --keepParent "$APP_BUNDLE" "$NOTARIZE_ZIP"
 
     info "Submitting to Apple notary service (this may take several minutes)..."
-    NOTARY_ARGS=(
-        --apple-id "$APPLE_ID"
-        --team-id "$TEAM_ID"
-        --wait
-    )
-    if [[ "$APP_PASSWORD" == "@keychain:"* ]]; then
+    if [[ "${APP_PASSWORD:-}" == "@keychain:"* ]]; then
         PROFILE_NAME="${APP_PASSWORD#@keychain:}"
         NOTARY_ARGS=(--keychain-profile "$PROFILE_NAME" --wait)
     else
-        NOTARY_ARGS+=(--password "$APP_PASSWORD")
+        NOTARY_ARGS=(
+            --apple-id "$APPLE_ID"
+            --team-id "$TEAM_ID"
+            --password "$APP_PASSWORD"
+            --wait
+        )
     fi
 
     NOTARY_OUTPUT=$(xcrun notarytool submit "$NOTARIZE_ZIP" "${NOTARY_ARGS[@]}" 2>&1) || {
@@ -200,14 +271,17 @@ fi
 # ── Step 5: Read version and create DMG ──────────────────────────────────────
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "${APP_BUNDLE}/Contents/Info.plist")
-DMG_NAME="${APP_NAME}-${VERSION}.dmg"
+# The file name carries the version without dots, matching the Windows installer: TERMinator-110.dmg
+VERSION_FLAT=$(echo "$VERSION" | tr -d '.')
+DMG_NAME="${APP_NAME}-${VERSION_FLAT}.dmg"
 DMG_PATH="${BUILD_DIR}/${DMG_NAME}"
 DMG_STAGING="${STAGING_DIR}/dmg-contents"
 
 info "Creating DMG (v${VERSION})..."
 
 mkdir -p "$DMG_STAGING"
-cp -R "$APP_BUNDLE" "$DMG_STAGING/"
+# ditto, not cp -R: keeps the bundle byte-for-byte (Helpers, Frameworks, symlinks, the stapled ticket)
+ditto "$APP_BUNDLE" "$DMG_STAGING/${APP_NAME}.app"
 ln -s /Applications "$DMG_STAGING/Applications"
 
 # Set volume icon if available

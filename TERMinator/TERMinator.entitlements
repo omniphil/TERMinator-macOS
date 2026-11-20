@@ -10,5 +10,16 @@
 	<true/>
 	<key>com.apple.security.files.downloads.read-write</key>
 	<true/>
+	<!--
+	  TRACE gamepads (Services/GamepadService.swift). A sandboxed app sees NO game controller at all without
+	  these: GameController reaches the pad through USB HID or Bluetooth, and the sandbox blocks both unless
+	  they are asked for here, so GCController.controllers() stays empty and the connect notification never
+	  fires. Nothing on Windows corresponds to this -- XInput needs no such permission -- so the port had no
+	  reason to add them. Wired pads need .usb, wireless ones .bluetooth; a module gets pad events from either.
+	-->
+	<key>com.apple.security.device.usb</key>
+	<true/>
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
 </dict>
 </plist>

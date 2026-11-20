@@ -16,23 +16,19 @@ enum PhonebookViewMode: String, CaseIterable {
         }
     }
 
-    var tileWidth: CGFloat {
+    /// Snapshot size: exact 4:3, the whole raw 16:10 snapshot stretched into it the way the
+    /// terminal's display does (Windows: small 129×97, medium 172×129, large 216×162).
+    var imageSize: CGSize {
         switch self {
-        case .list: return 0
-        case .smallTiles: return 150
-        case .mediumTiles: return 220
-        case .largeTiles: return 320
+        case .list: return CGSize(width: 52, height: 39)
+        case .smallTiles: return CGSize(width: 129, height: 97)
+        case .mediumTiles: return CGSize(width: 172, height: 129)
+        case .largeTiles: return CGSize(width: 216, height: 162)
         }
     }
 
-    var tileHeight: CGFloat {
-        switch self {
-        case .list: return 50
-        case .smallTiles: return 130
-        case .mediumTiles: return 190
-        case .largeTiles: return 260
-        }
-    }
+    /// Tile = snapshot + 4 padding + 2 border each side (large: 216 wide snapshot, 228 tile).
+    var tileWidth: CGFloat { imageSize.width + 12 }
 }
 
 /// Desktop-optimized phonebook view with configurable tile sizes.
@@ -86,6 +82,17 @@ struct PhonebookView: View {
             } else {
                 gridView
             }
+
+            // Call log line for the selected board (matches Windows: above the bottom bar)
+            Text(selectedEntry.map { "\($0.name): \(CallStatsService.shared.describe($0.id.uuidString))" } ?? " ")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                .padding(.bottom, 2)
 
             // Bottom bar (matches Windows: BACK left, view mode label right)
             HStack {
@@ -205,6 +212,10 @@ struct PhonebookView: View {
             .disabled(selectedEntry == nil)
             .opacity(selectedEntry == nil ? 0.5 : 1.0)
 
+            RetroButton(store.isSortedAlphabetically ? "UNSORT" : "SORT", style: .green) {
+                store.sortEntriesAlphabetically()
+            }
+
             Spacer()
 
             // Right: VIEW button cycles modes
@@ -242,7 +253,7 @@ struct PhonebookView: View {
                         }
                         .draggable(entry.id.uuidString) {
                             phonebookTile(entry)
-                                .frame(width: viewMode.tileWidth, height: viewMode.tileHeight)
+                                .frame(width: viewMode.tileWidth)
                                 .opacity(0.8)
                                 .onAppear {
                                     draggingEntry = entry
@@ -283,50 +294,7 @@ struct PhonebookView: View {
             set: { id in selectedEntry = store.entries.first { $0.id == id } }
         )) {
             ForEach(store.entries) { entry in
-                HStack(spacing: 12) {
-                    // Small thumbnail
-                    if let data = entry.snapshotData, let img = NSImage(data: data) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: 60, height: 38)
-                            .clipped()
-                            .cornerRadius(3)
-                    } else {
-                        Rectangle()
-                            .fill(Color.crtBackground)
-                            .frame(width: 60, height: 38)
-                            .cornerRadius(3)
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(entry.name)
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundColor(.termLightGreen)
-
-                        Text(entry.addressDisplay)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(.textSecondary)
-                    }
-
-                    Spacer()
-
-                    Text(entry.connectionProtocol.displayName)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.appPrimary)
-
-                    Text(entry.screenMode.displayName)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.textSecondary)
-
-                    if let lastConnected = entry.lastConnected {
-                        Text(lastConnected, style: .relative)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.textSecondary)
-                            .frame(width: 80, alignment: .trailing)
-                    }
-                }
-                .padding(.vertical, 4)
+                PhonebookRowView(entry: entry, isSelected: selectedEntry?.id == entry.id)
                 .tag(entry.id)
                 .contextMenu {
                     entryContextMenu(entry)
@@ -342,59 +310,7 @@ struct PhonebookView: View {
     // MARK: - Tile
 
     private func phonebookTile(_ entry: BBSEntry) -> some View {
-        let isSelected = selectedEntry?.id == entry.id
-
-        return VStack(spacing: 4) {
-            // Snapshot image (no tap gesture — whole tile handles selection)
-            if let data = entry.snapshotData, let img = NSImage(data: data) {
-                Image(nsImage: img)
-                    .resizable()
-                    .interpolation(.none)
-                    .aspectRatio(contentMode: .fill)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: viewMode.tileHeight * 0.6)
-                    .clipped()
-            } else {
-                Rectangle()
-                    .fill(Color.background)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: viewMode.tileHeight * 0.6)
-                    .overlay(
-                        Image(systemName: "tv")
-                            .font(.system(size: 24))
-                            .foregroundColor(.textSecondary.opacity(0.5))
-                    )
-            }
-
-            VStack(spacing: 2) {
-                Text(entry.name)
-                    .font(.system(size: viewMode == .smallTiles ? 10 : 11, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.accentGreen)
-                    .lineLimit(1)
-
-                Text(entry.addressDisplay)
-                    .font(.system(size: viewMode == .smallTiles ? 9 : 10, design: .monospaced))
-                    .foregroundColor(.textSecondary)
-                    .lineLimit(1)
-
-                if viewMode != .smallTiles {
-                    Text(entry.connectionDescription)
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.textSecondary.opacity(0.7))
-                        .lineLimit(1)
-                }
-            }
-            .padding(.horizontal, 6)
-            .padding(.bottom, 6)
-        }
-        .frame(width: viewMode.tileWidth, height: viewMode.tileHeight)
-        .background(Color.backgroundMedium)
-        .cornerRadius(2)
-        .overlay(
-            RoundedRectangle(cornerRadius: 2)
-                .stroke(isSelected ? Color.amberAccent : Color.panelBorder,
-                        lineWidth: 2)
-        )
+        PhonebookTileView(entry: entry, viewMode: viewMode, isSelected: selectedEntry?.id == entry.id)
     }
 
     // MARK: - Context Menu
@@ -417,6 +333,13 @@ struct PhonebookView: View {
         }
         Button("Set as Quick Connect 2") {
             UserDefaults.standard.set(entry.id.uuidString, forKey: "quick_connect_2_id")
+        }
+        // Slots 3–4 only show in the side-by-side home layout, but stay saved while hidden.
+        Button("Set as Quick Connect 3") {
+            UserDefaults.standard.set(entry.id.uuidString, forKey: "quick_connect_3_id")
+        }
+        Button("Set as Quick Connect 4") {
+            UserDefaults.standard.set(entry.id.uuidString, forKey: "quick_connect_4_id")
         }
     }
 
@@ -446,7 +369,121 @@ struct PhonebookView: View {
 
     private func connectTo(_ entry: BBSEntry) {
         store.updateLastConnected(for: entry)
-        appState.currentView = .terminal(entry)
+        // A window of its own, or here (Options > Separate Window per BBS)
+        SessionLauncher.connect(entry)
+    }
+}
+
+// MARK: - Tile and row views
+
+/// One phonebook grid tile: 4:3 snapshot (stretched, nearest-neighbor) over the name, address
+/// and (not small) connection description. Same hover look as the home tiles: amber border,
+/// lifted background, amber glow. A selected tile keeps a plain amber border.
+private struct PhonebookTileView: View {
+    let entry: BBSEntry
+    let viewMode: PhonebookViewMode
+    let isSelected: Bool
+
+    var body: some View {
+        let imageSize = viewMode.imageSize
+
+        VStack(spacing: 4) {
+            // Snapshot image (no tap gesture — whole tile handles selection)
+            if let data = entry.snapshotData, let img = NSImage(data: data) {
+                Image(nsImage: img)
+                    .resizable()
+                    .interpolation(.none)
+                    .frame(width: imageSize.width, height: imageSize.height)
+            } else {
+                Rectangle()
+                    .fill(Color.background)
+                    .frame(width: imageSize.width, height: imageSize.height)
+                    .overlay(
+                        Image(systemName: "tv")
+                            .font(.system(size: 24))
+                            .foregroundColor(.textSecondary.opacity(0.5))
+                    )
+            }
+
+            VStack(spacing: 2) {
+                Text(entry.name)
+                    .font(.system(size: viewMode == .smallTiles ? 10 : 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.accentGreen)
+                    .lineLimit(1)
+
+                Text(entry.addressDisplay)
+                    .font(.system(size: viewMode == .smallTiles ? 9 : 10, design: .monospaced))
+                    .foregroundColor(.textSecondary)
+                    .lineLimit(1)
+
+                if viewMode != .smallTiles {
+                    Text(entry.connectionDescription)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.textSecondary.opacity(0.7))
+                        .lineLimit(1)
+                }
+            }
+            .frame(width: imageSize.width)
+            .padding(.bottom, 2)
+        }
+        .padding(6)
+        .tileHover(selected: isSelected)
+    }
+}
+
+/// One phonebook list row, with the same hover glow as the tiles.
+private struct PhonebookRowView: View {
+    let entry: BBSEntry
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Small 4:3 thumbnail
+            if let data = entry.snapshotData, let img = NSImage(data: data) {
+                Image(nsImage: img)
+                    .resizable()
+                    .interpolation(.none)
+                    .frame(width: PhonebookViewMode.list.imageSize.width,
+                           height: PhonebookViewMode.list.imageSize.height)
+                    .cornerRadius(3)
+            } else {
+                Rectangle()
+                    .fill(Color.crtBackground)
+                    .frame(width: PhonebookViewMode.list.imageSize.width,
+                           height: PhonebookViewMode.list.imageSize.height)
+                    .cornerRadius(3)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.name)
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundColor(.termLightGreen)
+
+                Text(entry.addressDisplay)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.textSecondary)
+            }
+
+            Spacer()
+
+            Text(entry.connectionProtocol.displayName)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.appPrimary)
+
+            Text(entry.screenMode.displayName)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.textSecondary)
+
+            if let lastConnected = entry.lastConnected {
+                Text(lastConnected, style: .relative)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.textSecondary)
+                    .frame(width: 80, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .tileHover(selected: isSelected, cornerRadius: 3)
     }
 }
 
@@ -462,12 +499,15 @@ struct ConnectionEditorView: View {
     @State private var host: String = ""
     @State private var port: String = "23"
     @State private var connectionProtocol: ConnectionProtocol = .telnet
+    /// What the protocol picker held before the current change — used to decide
+    /// whether the port field is still on a default and may be swapped.
+    @State private var previousProtocol: ConnectionProtocol = .telnet
     @State private var username: String = ""
     @State private var password: String = ""
+    @State private var saveCredentials: Bool = false
     @State private var screenMode: ScreenMode = .mode80x25
     @State private var font: TerminalFont = .cp437
     @State private var showStatusBar: Bool = true
-    @State private var showButtonBar: Bool = true
     @State private var didLoad: Bool = false
 
     init(entry: BBSEntry?, onSave: @escaping (BBSEntry) -> Void) {
@@ -500,6 +540,7 @@ struct ConnectionEditorView: View {
                 Section("Authentication") {
                     TextField("Username", text: $username)
                     SecureField("Password", text: $password)
+                    Toggle("Save Credentials", isOn: $saveCredentials)
                 }
 
                 Section("Terminal") {
@@ -545,12 +586,16 @@ struct ConnectionEditorView: View {
                 host = entry.host
                 port = String(entry.port)
                 connectionProtocol = entry.connectionProtocol
+                previousProtocol = entry.connectionProtocol
                 username = entry.username
-                password = entry.password ?? ""
+                let storedPassword = entry.password ?? ""
+                password = storedPassword
+                // Default Save Credentials to true if a password is stored, matching
+                // Windows behavior (re-opens an entry with credentials still saved).
+                saveCredentials = !storedPassword.isEmpty
                 screenMode = entry.screenMode
                 font = entry.font
                 showStatusBar = entry.showStatusBar
-                showButtonBar = entry.showButtonBar
             }
             // Mark initial load complete on next run loop
             DispatchQueue.main.async {
@@ -558,16 +603,19 @@ struct ConnectionEditorView: View {
             }
         }
         .onChange(of: connectionProtocol) { newProtocol in
-            // Only auto-update port after initial load, and only if still a default
+            // Changing protocol swaps in that protocol's default port, but only if
+            // the port field still holds the PREVIOUS protocol's default (or is
+            // empty) — a custom port the user typed is left alone.
+            //
+            // Telnet <-> Raw is deliberately a no-op here: both default to 23, because
+            // Raw exists precisely for boards that answer on the telnet port without
+            // speaking telnet. Switching between the two keeps whatever port is there.
             guard didLoad else { return }
-            let defaultPorts = ["23", "22", "992", ""]
-            if defaultPorts.contains(port) {
-                switch newProtocol {
-                case .telnet: port = "23"
-                case .ssh: port = "22"
-                case .telnetS: port = "992"
-                }
+            if port.trimmingCharacters(in: .whitespaces).isEmpty
+                || Int(port.trimmingCharacters(in: .whitespaces)) == previousProtocol.defaultPort {
+                port = String(newProtocol.defaultPort)
             }
+            previousProtocol = newProtocol
         }
     }
 
@@ -581,10 +629,14 @@ struct ConnectionEditorView: View {
         updated.screenMode = screenMode
         updated.font = font
         updated.showStatusBar = showStatusBar
-        updated.showButtonBar = showButtonBar
 
-        if !password.isEmpty {
+        // Save Credentials behavior (matches Windows):
+        //   - checked + non-empty password → write to Keychain
+        //   - unchecked                    → delete any stored password
+        if saveCredentials && !password.isEmpty {
             updated.setPassword(password)
+        } else if !saveCredentials {
+            updated.setPassword(nil)
         }
 
         onSave(updated)

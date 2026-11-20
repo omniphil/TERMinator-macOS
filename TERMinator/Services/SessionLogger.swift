@@ -6,7 +6,7 @@ class SessionLogger {
 
     static let shared = SessionLogger()
 
-    private let logDirectory = "session_logs"
+    private let defaultLogSubdirectory = "session_logs"
     private let flushIntervalBytes: Int = 4096
 
     private var fileHandle: FileHandle?
@@ -23,10 +23,15 @@ class SessionLogger {
 
     // MARK: - Public Interface
 
-    /// The URL of the log directory, if it can be determined.
+    /// The URL of the log directory — honors the user-configured "log_directory"
+    /// setting, falling back to ~/Documents/session_logs.
     var logDirectoryURL: URL? {
+        let configured = UserDefaults.standard.string(forKey: "log_directory") ?? ""
+        if !configured.isEmpty {
+            return URL(fileURLWithPath: configured)
+        }
         let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        return documentsDir?.appendingPathComponent(logDirectory)
+        return documentsDir?.appendingPathComponent(defaultLogSubdirectory)
     }
 
     /// Check if logging is currently active.
@@ -62,9 +67,8 @@ class SessionLogger {
         lastFlushBytes = 0
 
         do {
-            // Create log directory if needed
-            let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let logDir = documentsDir.appendingPathComponent(logDirectory)
+            // Create log directory if needed (honors user-configured "log_directory")
+            guard let logDir = logDirectoryURL else { return false }
 
             if !FileManager.default.fileExists(atPath: logDir.path) {
                 try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
@@ -189,22 +193,21 @@ class SessionLogger {
 
     /// Get list of saved log files.
     func getLogFiles() -> [URL] {
-        let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let logDir = documentsDir.appendingPathComponent(logDirectory)
-
-        guard FileManager.default.fileExists(atPath: logDir.path) else {
+        guard let logDir = logDirectoryURL,
+              FileManager.default.fileExists(atPath: logDir.path) else {
             return []
         }
 
+        let dateKeys: Set<URLResourceKey> = [.contentModificationDateKey]
         do {
             let files = try FileManager.default.contentsOfDirectory(at: logDir,
-                                                                     includingPropertiesForKeys: [.contentModificationDateKey],
+                                                                     includingPropertiesForKeys: Array(dateKeys),
                                                                      options: .skipsHiddenFiles)
             return files
                 .filter { $0.pathExtension == "log" }
                 .sorted { url1, url2 in
-                    let date1 = (try? url1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
-                    let date2 = (try? url2.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
+                    let date1 = (try? url1.resourceValues(forKeys: dateKeys))?.contentModificationDate ?? Date.distantPast
+                    let date2 = (try? url2.resourceValues(forKeys: dateKeys))?.contentModificationDate ?? Date.distantPast
                     return date1 > date2
                 }
         } catch {

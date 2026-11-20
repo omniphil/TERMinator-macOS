@@ -39,9 +39,10 @@ class ModPlayer {
     }
 
     /// Set playback volume (0.0 - 1.0).
+    /// Only sets per-stream volume on the source node — never set device/native-level
+    /// volume, as it bleeds across audio channels (shared global xmp context).
     func setVolume(_ vol: Float) {
         volume = max(0, min(1, vol))
-        NativeBridge.shared.modSetVolume(volume)
         sourceNode?.volume = volume
     }
 
@@ -89,7 +90,8 @@ class ModPlayer {
 
             if rendered <= 0 {
                 if loopingCapture {
-                    // Fill silence this round; looping handled by libxmp loop param
+                    // Restart module from the beginning for seamless looping
+                    NativeBridge.shared.modRestart()
                     let bufferList = UnsafeMutableAudioBufferListPointer(audioBufferList)
                     for buffer in bufferList {
                         memset(buffer.mData, 0, Int(buffer.mDataByteSize))
@@ -157,7 +159,8 @@ class ModPlayer {
     }
 
     /// Stop playback and release resources.
-    func stop() {
+    /// `releaseNative: false` leaves libxmp's shared context alone (another player has taken it over).
+    func stop(releaseNative: Bool = true) {
         playing = false
         paused = false
 
@@ -168,7 +171,9 @@ class ModPlayer {
         sourceNode = nil
         engine = nil
 
-        NativeBridge.shared.modStop()
+        if releaseNative {
+            NativeBridge.shared.modStop()
+        }
         logger.info("ModPlayer stopped")
     }
 }

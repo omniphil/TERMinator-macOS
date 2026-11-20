@@ -57,6 +57,7 @@ targets:
           - "$(SRCROOT)/TERMinator/Bridge/syncterm"
           - "$(SRCROOT)/TERMinator/Bridge/sbbs3"
           - "$(SRCROOT)/TERMinator/Bridge/encode"
+          - "$(SRCROOT)/TERMinator/Bridge/hash"
           - "$(SRCROOT)/TERMinator/Bridge/uifc"
           - "$(SRCROOT)/TERMinator/Bridge/sftp"
           - "$(SRCROOT)/TERMinator/Bridge/libxmp"
@@ -64,6 +65,7 @@ targets:
         GCC_PREPROCESSOR_DEFINITIONS:
           - "__unix__=1"
           - "LIBXMP_NO_PROWIZARD=1"
+          - "WITH_WEBSOCKET=1"
           - "$(inherited)"
         # Suppress warnings in C bridge code
         OTHER_CFLAGS:
@@ -81,19 +83,26 @@ targets:
           - "DEBUG=1"
           - "__unix__=1"
           - "LIBXMP_NO_PROWIZARD=1"
+          - "WITH_WEBSOCKET=1"
           - "$(inherited)"
       release:
         GCC_PREPROCESSOR_DEFINITIONS:
           - "__unix__=1"
           - "LIBXMP_NO_PROWIZARD=1"
+          - "WITH_WEBSOCKET=1"
           - "$(inherited)"
 
     dependencies:
       - sdk: Metal.framework
       - sdk: MetalKit.framework
+      # The cracktro's tumbling 3D splash card (CracktroView) is SceneKit.
+      - sdk: SceneKit.framework
       - sdk: Security.framework
       - sdk: AVFoundation.framework
       - sdk: AVKit.framework
+      # Gamepads for TRACE modules (Services/GamepadService.swift): Xbox / PlayStation / MFi pads, and their rumble
+      - sdk: GameController.framework
+      - sdk: CoreHaptics.framework
       # cryptlib static library is linked via LIBRARY_SEARCH_PATHS and OTHER_LDFLAGS above
 
     preBuildScripts: []

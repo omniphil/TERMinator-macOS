@@ -121,7 +121,8 @@ class BellManager: ObservableObject {
     // Settings keys
     private let soundEnabledKey = "sound_enabled"
     private let bellSoundKey = "bell_sound"
-    private let bellVolumeKey = "bell_volume"
+    private let bellVolumeKey = "bell_volume"           // Legacy: Float 0.0-1.0
+    private let bellVolumeIntKey = "bell_volume_int"    // New: Int 0-10 (matches Windows/Android)
 
     @Published var soundEnabled: Bool {
         didSet { UserDefaults.standard.set(soundEnabled, forKey: soundEnabledKey) }
@@ -131,9 +132,21 @@ class BellManager: ObservableObject {
         didSet { UserDefaults.standard.set(bellSound.rawValue, forKey: bellSoundKey) }
     }
 
-    @Published var volume: Float {
-        didSet { UserDefaults.standard.set(volume, forKey: bellVolumeKey) }
+    /// Bell volume as a discrete 0-10 scale (matches Windows / Android).
+    /// Internally drives the underlying float gain.
+    @Published var volumeLevel: Int {
+        didSet {
+            let clamped = max(0, min(10, volumeLevel))
+            if clamped != volumeLevel {
+                volumeLevel = clamped
+                return
+            }
+            UserDefaults.standard.set(volumeLevel, forKey: bellVolumeIntKey)
+        }
     }
+
+    /// Underlying gain (0.0-1.0) derived from volumeLevel.
+    var volume: Float { Float(volumeLevel) / 10.0 }
 
     private init() {
         // Load settings
@@ -143,7 +156,15 @@ class BellManager: ObservableObject {
         } else {
             bellSound = .vt100
         }
-        volume = UserDefaults.standard.object(forKey: bellVolumeKey) as? Float ?? 0.5
+        // Migrate legacy float volume → discrete 0-10
+        if let intVol = UserDefaults.standard.object(forKey: bellVolumeIntKey) as? Int {
+            volumeLevel = max(0, min(10, intVol))
+        } else if let floatVol = UserDefaults.standard.object(forKey: bellVolumeKey) as? Float {
+            volumeLevel = Int((floatVol * 10).rounded())
+            UserDefaults.standard.set(volumeLevel, forKey: bellVolumeIntKey)
+        } else {
+            volumeLevel = 5  // 50% default, matches Windows / Android
+        }
 
         setupAudioEngine()
     }

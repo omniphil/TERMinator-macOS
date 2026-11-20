@@ -19,6 +19,8 @@ extern int             ssh_channel;
 extern pthread_mutex_t ssh_mutex;
 extern int             sftp_channel;
 extern bool            sftp_active;
+extern int             ssh_blank_login;  /* TERMinator desktop: log in with no credentials (see ssh.c) */
+extern int             ssh_offer_key;    /* 0 = never offer the client key (TERMinator desktop, see ssh.c) */
 void cryptlib_error_message(int status, const char *msg);
 
 #endif // ifndef _SSH_H_

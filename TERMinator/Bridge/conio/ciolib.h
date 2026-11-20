@@ -469,6 +469,7 @@ CIOLIBEXPORT int ciolib_wherey(void);
 CIOLIBEXPORT void ciolib_wscroll(void);
 CIOLIBEXPORT void ciolib_gotoxy(int x, int y);
 CIOLIBEXPORT void ciolib_clreol(void);
+CIOLIBEXPORT void ciolib_clear_pixel_rect(int sx, int sy, int ex, int ey);
 CIOLIBEXPORT void ciolib_clrscr(void);
 CIOLIBEXPORT int ciolib_cputs(const char *str);
 CIOLIBEXPORT int ciolib_cprintf(const char *fmat, ...);

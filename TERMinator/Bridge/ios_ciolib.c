@@ -46,6 +46,9 @@ extern struct conio_font_data_struct conio_fontdata[257];
 // Declared in syncterm_ios.c — saves one line into the scrollback ring buffer.
 extern void scrollback_save_line(const struct vmem_cell *line, int width);
 
+// Current font ID — defined in syncterm_ios.c, updated by setfont callback
+extern int g_current_font_id;
+
 // iOS-specific screen state
 static struct ios_screen_state {
     struct vmem_cell *screen;
@@ -1335,9 +1338,10 @@ static void ios_setname(const char *name) {
 }
 
 static int ios_setfont(int font, int force, int font_num) {
-    (void)font;
     (void)force;
-    (void)font_num;
+    if ((font_num == 0 || font_num == 1) && font >= 0 && font < 256) {
+        g_current_font_id = font;
+    }
     return 0;
 }
 
@@ -1355,9 +1359,9 @@ static int ios_getvideoflags(void) {
 }
 
 static int ios_setpalette(uint32_t entry, uint16_t r, uint16_t g, uint16_t b) {
-    if (entry >= 16) return 0;
+    if (entry >= 65536) return 0;
     pthread_mutex_lock(&ios_state.mutex);
-    ios_state.palette[entry] = ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    ios_state.palette[entry] = ((r >> 8) << 16) | ((g >> 8) << 8) | (b >> 8);
     pthread_mutex_unlock(&ios_state.mutex);
     return 1;
 }

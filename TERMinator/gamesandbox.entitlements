@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the TRACE sandbox host (Contents/Helpers/gamesandbox), signed by scripts/embed-trace-host.sh.
+  Not used by the app target itself.
+  * app-sandbox + inherit: TERMinator is sandboxed, and a helper it launches must run inside the app's sandbox
+    (it then reads the frame file in the app's temp dir and the module cache in its Application Support, both in the
+    app's container). A sandboxed child needs exactly these two App Sandbox keys and no others.
+  * cs.allow-jit + cs.allow-unsigned-executable-memory: hardened runtime exceptions (not App Sandbox keys) for
+    Wasmtime, which compiles WebAssembly to machine code at run time.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.inherit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>

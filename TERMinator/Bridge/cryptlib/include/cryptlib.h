@@ -1,7 +1,7 @@
 /****************************************************************************
 *																			*
 *							  cryptlib Header File							*
-*						Copyright Peter Gutmann 1992-2026					*
+*						Copyright Peter Gutmann 1992-2023					*
 *																			*
 ****************************************************************************/
 
@@ -9,9 +9,10 @@
 
 #define _CRYPTLIB_DEFINED
 
-/* The current cryptlib version: 3.4.9 */
+/* The current cryptlib version: 3.4.8 */
 
-#define CRYPTLIB_VERSION	349
+#define CRYPTLIB_VERSION	348
+#define CRYPTLIB_PATCHES "87c63616ae2f41d38c0b7c12a6461b24  -"
 
 /* Fixup for Windows support.  We need to include windows.h for various types
    and prototypes needed for DLLs, but this pulls in wincrypt.h which defines 
@@ -189,12 +190,6 @@
 
 #endif /* _CRYPT_DEFINED */
 
-/* The following is a marker for header preprocessing tools.  This is used
-   by scripts that preprocess cryptlib.h to create bindings for different
-   languages and should not be removed */
-
-/* END_OF_PREAMBLE */
-
 /****************************************************************************
 *																			*
 *							Algorithm and Object Types						*
@@ -227,8 +222,8 @@ typedef enum {						/* Algorithms */
 	CRYPT_ALGO_RESERVED3,			/* Formerly KEA */
 	CRYPT_ALGO_ECDSA,				/* ECDSA */
 	CRYPT_ALGO_ECDH,				/* ECDH */
-	CRYPT_ALGO_25519,				/* X25519 */
-	CRYPT_ALGO_ED25519,				/* Ed25519 */
+	CRYPT_ALGO_EDDSA,				/* EDDSA */
+	CRYPT_ALGO_25519,				/* X25519/X448 */
 
 	/* Hash algorithms */
 	CRYPT_ALGO_RESERVED4 = 200,		/* Formerly MD2 */
@@ -268,7 +263,7 @@ typedef enum {						/* Algorithms */
 
 	CRYPT_ALGO_LAST,				/* Last possible crypt algo value */
 #ifdef _CRYPT_DEFINED
-	CRYPT_ALGO_LAST_EXTERNAL = CRYPT_ALGO_POLY1305 + 1,
+	CRYPT_ALGO_LAST_EXTERNAL = CRYPT_ALGO_HMAC_SHAng + 1,
 #endif /* _CRYPT_DEFINED */
 
 	/* In order that we can scan through a range of algorithms with
@@ -507,6 +502,7 @@ typedef enum {
 	CRYPT_OPTION_INFO_MAJORVERSION,	/* Major release version */
 	CRYPT_OPTION_INFO_MINORVERSION,	/* Minor release version */
 	CRYPT_OPTION_INFO_STEPPING,		/* Release stepping */
+	CRYPT_OPTION_INFO_PATCHES,		/* MD5Sum of patches applied */
 
 	/* Encryption options */
 	CRYPT_OPTION_ENCR_ALGO,			/* Conventional encryption algorithm */
@@ -598,6 +594,7 @@ typedef enum {
 	/* Misc.information */
 	CRYPT_CTXINFO_LABEL,			/* Label for private/secret key */
 	CRYPT_CTXINFO_PERSISTENT,		/* Obj.is backed by device or keyset */
+	CRYPT_CTXINFO_SSH_PUBLIC_KEY,
 
 	/* Used internally */
 	CRYPT_CTXINFO_LAST, CRYPT_CERTINFO_FIRST = 2000,
@@ -1240,13 +1237,14 @@ typedef enum {
 	CRYPT_SESSINFO_PASSWORD,		/* Password */
 	CRYPT_SESSINFO_AUTHTOKEN,		/* Authentication token, e.g. TOTP */
 	CRYPT_SESSINFO_PRIVATEKEY,		/* Server/client private key */
+	CRYPT_SESSINFO_PUBLICKEY,		/* Other sides public key */
 	CRYPT_SESSINFO_KEYSET,			/* Certificate store */
 	CRYPT_SESSINFO_AUTHRESPONSE,	/* Session authorisation OK */
 
 	/* Client/server information */
 	CRYPT_SESSINFO_SERVER_NAME,		/* Server name */
 	CRYPT_SESSINFO_SERVER_PORT,		/* Server port number */
-	CRYPT_SESSINFO_SERVER_FINGERPRINT_SHA2,/* Server key fingerprint */
+	CRYPT_SESSINFO_SERVER_FINGERPRINT_SHA1,/* Server key fingerprint */
 	CRYPT_SESSINFO_CLIENT_NAME,		/* Client name */
 	CRYPT_SESSINFO_CLIENT_PORT,		/* Client port number */
 	CRYPT_SESSINFO_SESSION,			/* Transport mechanism */
@@ -1268,6 +1266,7 @@ typedef enum {
 	CRYPT_SESSINFO_SSH_CHANNEL_ARG2,/* SSH channel argument 2 */
 	CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE,/* SSH channel active */
 	CRYPT_SESSINFO_SSH_PREAUTH,		/* SSH pre-authentication value */
+	CRYPT_SESSINFO_SSH_OPTIONS,		/* SSH protocol options */
 	CRYPT_SESSINFO_TLS_OPTIONS,		/* SSL/TLS protocol options */
 		CRYPT_SESSINFO_SSL_OPTIONS = CRYPT_SESSINFO_TLS_OPTIONS,
 	CRYPT_SESSINFO_TLS_SUBPROTOCOL,	/* SSL/TLS additional sub-protocol */
@@ -1276,6 +1275,12 @@ typedef enum {
 	CRYPT_SESSINFO_TLS_EAPKEY,		/* TLS EAP key */
 	CRYPT_SESSINFO_TLS_EAPDATA,		/* TLS EAP additional data */
 	CRYPT_SESSINFO_TSP_MSGIMPRINT,	/* TSP message imprint */
+
+	/* Terminal attributes */
+	CRYPT_SESSINFO_SSH_CHANNEL_TERMINAL,	/* TERM string sent to remote */
+	CRYPT_SESSINFO_SSH_CHANNEL_WIDTH,	/* Terminal width */
+	CRYPT_SESSINFO_SSH_CHANNEL_HEIGHT,	/* Terminal height */
+	CRYPT_SESSINFO_SSH_CHANNEL_OPEN,	/* True if write channel is open for read */
 
 	/* Used internally */
 	CRYPT_SESSINFO_LAST, CRYPT_USERINFO_FIRST = 7000,
@@ -1351,7 +1356,6 @@ typedef enum {
 	CRYPT_IATTRIBUTE_KEY_PGP_PARTIAL,/* PGP public key w/o trigger */
 	CRYPT_IATTRIBUTE_KEY_DLPPARAM,	/* DLP domain parameters */
 	CRYPT_IATTRIBUTE_KEY_ECCPARAM,	/* ECC domain parameters */
-	CRYPT_IATTRIBUTE_KEY_IMPLICIT,	/* Implicit domain parameters */
 	CRYPT_IATTRIBUTE_PGPVALIDITY,	/* PGP key validity */
 	CRYPT_IATTRIBUTE_DEVICEOBJECT,	/* Handle for object in device */
 	CRYPT_IATTRIBUTE_DEVICESTORAGEID,/* Storage ID for data in device */
@@ -1439,7 +1443,7 @@ typedef enum {
 	CRYPT_CERTINFO_FIRST_CMS = CRYPT_CERTINFO_CMS_CONTENTTYPE,
 	CRYPT_CERTINFO_LAST_CMS = CRYPT_CERTINFO_LAST - 1,
 	CRYPT_SESSINFO_FIRST_SPECIFIC = CRYPT_SESSINFO_REQUEST,
-	CRYPT_SESSINFO_LAST_SPECIFIC = CRYPT_SESSINFO_TSP_MSGIMPRINT
+	CRYPT_SESSINFO_LAST_SPECIFIC = CRYPT_SESSINFO_SSH_CHANNEL_OPEN
 
 	/* Point at which private-use values start.  Attribute values sometimes
 	   need to be extended with additional pseudo-values in object-specific
@@ -1763,8 +1767,17 @@ typedef enum {
 #define CRYPT_TLSOPTION_RESUMED				0x080	/* TLS session is resumed */
 #define CRYPT_TLSOPTION_SUITEB_128			0x100	/* SuiteB security levels (will */
 #define CRYPT_TLSOPTION_SUITEB_256			0x200	/*  vanish in future releases) */
+#define CRYPT_TLSOPTION_USED_PSK			0x200	/*  Synchronet extension */
 #ifdef _CRYPT_DEFINED
 #define CRYPT_TLSOPTION_MAX					0x07F	/* Defines for range checking */
+#endif /* _CRYPT_DEFINED */
+
+/* SSH protocol options. */
+
+#define CRYPT_SSHOPTION_NONE				0x000
+#define CRYPT_SSHOPTION_NONE_AUTH			0x001	/* Try none authentication */
+#ifdef _CRYPT_DEFINED
+#define CRYPT_SSHOPTION_MAX					0x01	/* Defines for range checking */
 #endif /* _CRYPT_DEFINED */
 
 /****************************************************************************
@@ -1840,12 +1853,8 @@ typedef enum {
 	CRYPT_KEYOPT_READONLY,			/* Open keyset in read-only mode */
 	CRYPT_KEYOPT_CREATE,			/* Create a new keyset */
 #ifdef _CRYPT_DEFINED
-	/* Internal keyset options.  _EXCLUSIVEWRITE is used when creating/
-	   updating configuration and user index files, _SAFEREAD is used
-	   when reading them and performs additional checks such as making
-	   sure that the file isn't world-writeable on multiuser systems */
-	CRYPT_IKEYOPT_EXCLUSIVEWRITE,	/* As _NONE but open for exclusive access */
-	CRYPT_IKEYOPT_SAFEREAD,			/* As _READONLY but with extra checks */
+	/* Internal keyset options */
+	CRYPT_IKEYOPT_EXCLUSIVEACCESS,	/* As _NONE but open for exclusive access */
 #endif /* _CRYPT_DEFINED */
 	CRYPT_KEYOPT_LAST				/* Last possible key option type */
 #ifdef _CRYPT_DEFINED
@@ -2005,19 +2014,6 @@ typedef struct {
 	unsigned char d[ CRYPT_MAX_PKCSIZE_ECC ];/* Private random integer */
 	int dLen;					/* Length of integer in bits */
 	} CRYPT_PKCINFO_ECC;
-
-typedef struct {
-	/* Status information */
-	int isPublicKey;			/* Whether this is a public or private key */
-
-	/* Public components */
-	unsigned char pub[ CRYPT_MAX_PKCSIZE ];	/* Public value */
-	int pubLen;					/* Length of public value in bits */
-
-	/* Private components */
-	unsigned char priv[ CRYPT_MAX_PKCSIZE ];/* Private value */
-	int privLen;				/* Length of private value in bits */
-	} CRYPT_PKCINFO_DJB;
 
 /* Macros to initialise and destroy the structure that stores the components
    of a public key */
@@ -2285,7 +2281,7 @@ C_RET cryptGetKey( C_IN CRYPT_KEYSET keyset,
 C_CHECK_RETVAL \
 C_RET cryptAddPublicKey( C_IN CRYPT_KEYSET keyset,
 						 C_IN CRYPT_CERTIFICATE certificate );
-C_CHECK_RETVAL \
+C_CHECK_RETVAL C_NONNULL_ARG( ( 3 ) ) \
 C_RET cryptAddPrivateKey( C_IN CRYPT_KEYSET keyset,
 						  C_IN CRYPT_HANDLE cryptKey,
 						  C_IN C_STR password );

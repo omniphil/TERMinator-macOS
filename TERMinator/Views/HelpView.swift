@@ -32,166 +32,105 @@ struct HelpView: View {
 
             // Content
             ScrollView {
+                // Section for section, in order and wording, the Windows client's HelpWindow.xaml; only the
+                // shortcuts, menu paths and storage that genuinely differ on a Mac are adapted.
                 VStack(alignment: .leading, spacing: 24) {
-                    // Terminal Controls
                     helpSection(title: "Terminal Controls") {
-                        helpSubsection(title: "Keyboard Shortcuts") {
-                            Text("Standard keyboard input is sent directly to the BBS. Additional shortcuts:")
-                            bulletPoint("Cmd+C / Cmd+V - Copy / Paste")
-                            bulletPoint("Cmd+Return - Toggle Full Screen")
-                            bulletPoint("Cmd+P - Open Phonebook")
-                            bulletPoint("Cmd+D - Disconnect")
-                            bulletPoint("Cmd+U - Send File (ZMODEM)")
-                            bulletPoint("Cmd+, - Open Preferences")
-                            bulletPoint("Esc, Tab, Ctrl+key - Sent directly to BBS")
+                        helpSubsection(title: "Keyboard") {
+                            bulletPoint("Standard keyboard input is sent straight to the BBS.")
+                            bulletPoint("Cmd+C / Cmd+V - copy the selection / paste")
+                            bulletPoint("Cmd+A - select the whole screen")
+                            bulletPoint("Cmd+Option+Return - toggle full screen")
+                            bulletPoint("Option+I - send the saved login")
+                            bulletPoint("Cmd+Shift+S - save a screenshot; File > Take BBS Snapshot sets the phonebook image")
+                            bulletPoint("Esc, Tab and Ctrl+key are sent to the BBS untouched")
                         }
 
-                        helpSubsection(title: "Right-Click Menu") {
-                            Text("Right-click anywhere on the terminal to access:")
-                            bulletPoint("Paste Text - paste from clipboard")
-                            bulletPoint("Show/Hide Cursor")
-                            bulletPoint("Show/Hide Status Bar")
-                            bulletPoint("Send File (ZMODEM) - upload a file")
-                            bulletPoint("Capture Screenshot - save to disk")
-                            bulletPoint("Save Thumbnail - set Phonebook image")
-                            bulletPoint("Toggle Logging - record session")
-                            bulletPoint("Disconnect - close connection")
-                        }
-
-                        helpSubsection(title: "Zoom") {
-                            bulletPoint("Cmd+ (Cmd and Plus) to zoom in")
-                            bulletPoint("Cmd- (Cmd and Minus) to zoom out")
-                            bulletPoint("Cmd+0 to reset to 100%")
-                            bulletPoint("Pinch gesture on trackpad also works")
+                        helpSubsection(title: "Selection and URLs") {
+                            bulletPoint("Drag with the mouse to select text.")
+                            bulletPoint("Click a URL shown on screen to open it in your browser.")
                         }
 
                         helpSubsection(title: "Scrollback") {
-                            bulletPoint("Scroll wheel or trackpad two-finger scroll to browse history")
-                            bulletPoint("Scroll up to view previous output")
-                            bulletPoint("Scroll down to return to the live session")
+                            bulletPoint("Scroll the wheel (or two fingers on the trackpad) up to browse the history, down to return to the live session.")
+                            bulletPoint("A SCROLLBACK banner shows how many lines back you are.")
                         }
 
-                        helpSubsection(title: "Clickable URLs") {
-                            Text("Click URLs displayed on screen to open them in your default browser.")
-                        }
-
-                        helpSubsection(title: "Connection Status Bar") {
-                            Text("Shows BBS name, connection time, screen mode, and data transfer stats. Can be toggled per-connection via the right-click menu.")
+                        helpSubsection(title: "Status bar") {
+                            bulletPoint("Shows the BBS name, connection time, screen mode and transfer stats.")
                         }
                     }
 
-                    // Session Logging
+                    helpSection(title: "CRT and Scanline Effects") {
+                        helpSubsection(title: "Turning it on") {
+                            bulletPoint("View menu > CRT / Scanline Effect... then tick Enable CRT effect.")
+                            bulletPoint("The window is modeless: leave it open and dial the look in against live ANSI art.")
+                            bulletPoint("Twelve presets, from Subtle Scanlines to Worn Out Tube.")
+                            bulletPoint("RESET restores the factory look and leaves the on/off switch alone.")
+                        }
+                    }
+
                     helpSection(title: "Session Logging") {
-                        helpSubsection(title: "Capture Session Transcript") {
-                            bulletPoint("View menu > \"Toggle Logging\" while connected")
-                            bulletPoint("Red \"REC\" indicator appears in the status bar")
-                            bulletPoint("Toggle again to stop recording")
-                            bulletPoint("Logs saved with BBS name and timestamp")
-                            bulletPoint("Open log directory from Settings > Session Logging")
+                        helpSubsection(title: "Recording a transcript") {
+                            bulletPoint("Call > Log Session while connected. It stays ticked while a transcript is being written.")
+                            bulletPoint("Untick it to stop.")
+                            bulletPoint("Logs are named after the BBS and the time, in the folder set in Preferences.")
                         }
                     }
 
-                    // File Transfer
-                    helpSection(title: "File Transfer (ZMODEM)") {
-                        helpSubsection(title: "Auto-Detection") {
-                            Text("Downloads start automatically when the BBS initiates a ZMODEM transfer.")
+                    helpSection(title: "File Transfer") {
+                        helpSubsection(title: "ZMODEM") {
+                            bulletPoint("Downloads start on their own when the BBS begins a ZMODEM send.")
+                            bulletPoint("To upload: start the receive on the BBS first, then Transfer > Send File... (Cmd+U).")
                         }
 
-                        helpSubsection(title: "Send File") {
-                            bulletPoint("Start ZMODEM receive on the BBS first")
-                            bulletPoint("Transfer menu > \"Send File...\" (Cmd+U)")
-                            bulletPoint("Select a file from the file picker")
-                            bulletPoint("File will upload automatically")
-                        }
-
-                        helpSubsection(title: "Receive File") {
-                            bulletPoint("Usually auto-detected when the BBS sends")
-                            bulletPoint("Saves to the app Documents folder")
+                        helpSubsection(title: "XMODEM / YMODEM") {
+                            bulletPoint("Nothing is auto-detected. Start the transfer on the BBS first, then pick the SAME protocol here.")
+                            bulletPoint("Transfer > Send File via - XMODEM (128-byte), XMODEM (1K), YMODEM.")
+                            bulletPoint("Transfer > Receive File via - XMODEM, YMODEM, YMODEM-G.")
+                            bulletPoint("XMODEM carries no filename, so a receive asks where to save before it starts.")
+                            bulletPoint("128-byte blocks are listed first because many 8-bit boards accept nothing else.")
                         }
                     }
 
-                    // SSH Connections
-                    helpSection(title: "SSH Connections") {
-                        helpSubsection(title: "SSH Credentials") {
-                            bulletPoint("Passwords are encrypted using macOS Keychain")
-                            bulletPoint("Passwords are NOT exported with your BBS list")
-                            bulletPoint("When editing, leave password empty to keep existing")
-                        }
-                    }
-
-                    // Home Screen
-                    helpSection(title: "Home Screen") {
-                        helpSubsection(title: "Quick Connect Buttons") {
-                            Text("Two customizable slots for instant connection to your favorite BBSes.")
-                        }
-
-                        helpSubsection(title: "Setting Quick Connect") {
-                            Text("Click an empty Quick Connect slot to go to the Phonebook and choose a BBS.")
-                        }
-
-                        helpSubsection(title: "Connecting") {
-                            Text("Double-click a Quick Connect slot to connect to that BBS.")
-                        }
-                    }
-
-                    // Phonebook
                     helpSection(title: "Phonebook") {
-                        helpSubsection(title: "View Modes") {
-                            Text("Use the view mode buttons in the toolbar to switch between List, Small, Medium, and Large tile layouts.")
+                        helpSubsection(title: "Managing connections") {
+                            bulletPoint("File > Phonebook (Cmd+P) opens your BBS list.")
+                            bulletPoint("Drag a tile to reorder the list.")
+                            bulletPoint("Snapshots taken during a session appear as the tile thumbnail.")
+                            bulletPoint("Switch between List, Small, Medium and Large layouts from the toolbar.")
                         }
 
-                        helpSubsection(title: "Edit/Delete") {
-                            Text("Click a connection to open its edit sheet where you can modify settings or delete it.")
-                        }
-
-                        helpSubsection(title: "Thumbnails") {
-                            Text("Snapshots taken during sessions appear as thumbnails in the tile views.")
-                        }
-
-                        helpSubsection(title: "Add New") {
-                            Text("Click the \"+\" button in the Phonebook toolbar to add a new BBS entry.")
-                        }
-                    }
-
-                    // Menu Bar
-                    helpSection(title: "Menu Bar") {
-                        helpSubsection(title: "File Menu") {
-                            bulletPoint("Phonebook (Cmd+P) - open your BBS list")
-                            bulletPoint("Disconnect (Cmd+D) - close current connection")
-                        }
-
-                        helpSubsection(title: "Transfer Menu") {
-                            bulletPoint("Send File... (Cmd+U) - ZMODEM upload")
-                            bulletPoint("Receive File - ZMODEM download")
-                        }
-
-                        helpSubsection(title: "View Menu") {
-                            bulletPoint("Full Screen (Cmd+Return)")
-                            bulletPoint("Toggle Logging")
-                        }
-
-                        helpSubsection(title: "Preferences") {
-                            bulletPoint("Preferences (Cmd+,) - open settings")
-                            bulletPoint("Clear TAP+ Cache - remove cached audio")
+                        // Same wording as Windows HelpWindow.xaml (File menu items; ImportExportManager does the .zip
+                        // itself, no ZIP library). Preferences > Backup & Restore runs the same two flows.
+                        helpSubsection(title: "Import and export") {
+                            bulletPoint("File > Export Phonebook... writes a .zip of your connections and their snapshots, or a plain .xml.")
+                            bulletPoint("File > Import Phonebook... reads either back, and asks whether to merge or replace.")
+                            bulletPoint("The format is shared with the Windows and Linux clients.")
+                            bulletPoint("Passwords are NEVER exported - they stay in the macOS Keychain.")
                         }
                     }
 
-                    // Settings
+                    helpSection(title: "Connections") {
+                        helpSubsection(title: "Protocols") {
+                            bulletPoint("Telnet, Raw, SSH, Telnet over SSL, and WebSocket (plain or secure).")
+                            bulletPoint("Raw is a plain 8-bit socket with no telnet negotiation.")
+                        }
+
+                        helpSubsection(title: "Credentials") {
+                            bulletPoint("Saved passwords are held in the macOS Keychain, not the phonebook.")
+                            bulletPoint("Leave the password blank when editing to keep the existing one.")
+                            bulletPoint("Call > Show SSH Debug Log shows the negotiation log after a failed SSH connection.")
+                        }
+                    }
+
                     helpSection(title: "Settings") {
-                        helpSubsection(title: "Bell & Notifications") {
-                            bulletPoint("Toggle sounds on or off")
-                            bulletPoint("Choose from 30 vintage computer bell tones")
-                            bulletPoint("Adjust volume with the slider")
-                        }
-
-                        helpSubsection(title: "TAP - Terminal Audio Protocol") {
-                            bulletPoint("Enable/disable BBS background music")
-                            bulletPoint("Manage audio cache size")
-                        }
-
-                        helpSubsection(title: "Backup & Restore") {
-                            bulletPoint("Export/Import BBS connections list")
-                            bulletPoint("Passwords are excluded for security")
+                        helpSubsection(title: "Preferences") {
+                            bulletPoint("Bell sound: pick from 30 vintage tones, or switch it off.")
+                            bulletPoint("Terminal: default font and screen mode for new connections.")
+                            bulletPoint("TAP+: BBS background music, and the audio cache limit.")
+                            bulletPoint("File transfer: download folder and ZMODEM auto-detect.")
+                            bulletPoint("Session logging: where transcripts are written.")
                         }
                     }
                 }

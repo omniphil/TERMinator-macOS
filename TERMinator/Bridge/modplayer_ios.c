@@ -16,7 +16,6 @@
 
 static xmp_context g_mod_ctx = NULL;
 static volatile int g_mod_playing = 0;
-static volatile int g_mod_volume = 100;  /* 0-100 */
 static pthread_mutex_t g_mod_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Load a module file and start the player */
@@ -61,8 +60,9 @@ bool native_mod_load(const char *filePath) {
         return false;
     }
 
-    /* Apply current volume */
-    xmp_set_player(g_mod_ctx, XMP_PLAYER_VOLUME, g_mod_volume);
+    /* Always render at full volume — per-stream volume is handled by
+     * AVAudioSourceNode.volume in Swift to avoid cross-channel bleed. */
+    xmp_set_player(g_mod_ctx, XMP_PLAYER_VOLUME, 100);
 
     g_mod_playing = 1;
 
@@ -117,18 +117,11 @@ void native_mod_stop(void) {
     pthread_mutex_unlock(&g_mod_lock);
 }
 
-/* Set playback volume (0.0 - 1.0 mapped to 0-100) */
+/* Set playback volume — intentionally a no-op.
+ * Volume is controlled exclusively by AVAudioSourceNode.volume (per-stream)
+ * to prevent cross-channel volume bleed via the shared global xmp context. */
 void native_mod_set_volume(float volume) {
-    int vol = (int)(volume * 100.0f);
-    if (vol < 0) vol = 0;
-    if (vol > 100) vol = 100;
-
-    pthread_mutex_lock(&g_mod_lock);
-    g_mod_volume = vol;
-    if (g_mod_ctx != NULL && g_mod_playing) {
-        xmp_set_player(g_mod_ctx, XMP_PLAYER_VOLUME, vol);
-    }
-    pthread_mutex_unlock(&g_mod_lock);
+    (void)volume;
 }
 
 /* Seek to a position in the current module (milliseconds) */

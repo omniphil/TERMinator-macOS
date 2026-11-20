@@ -59,8 +59,8 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 int g_term_width = 80;
 int g_term_height = 25;
 
-// Current font ID
-static int g_current_font_id = 0;
+// Current font ID (non-static: also updated by ios_ciolib.c setfont callback)
+int g_current_font_id = 0;
 
 // Connection settings
 static int g_hide_status_line = 1;
@@ -992,6 +992,10 @@ bool native_get_connection_stats(int64_t *sent, int64_t *received,
 // ============================================================================
 // MARK: - Font Bitmap Functions
 // ============================================================================
+
+int32_t native_get_current_font_id(void) {
+    return g_current_font_id;
+}
 
 static uint8_t g_font_bitmap_cache[256 * 16 + 2];  // Max size + header
 

@@ -22,7 +22,8 @@
 #ifndef _SEXYZ_H_
 #define _SEXYZ_H_
 
-/* Note: xmodem.h not included - we only use ZMODEM on iOS */
+#include "xmodem.h"
+#include "zmodem.h"
 
 #define MAXERRORS   10
 

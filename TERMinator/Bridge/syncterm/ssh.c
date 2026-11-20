@@ -34,6 +34,26 @@ pthread_mutex_t ssh_tx_mutex;
 int             sftp_channel = -1;
 sftpc_state_t   sftp_state;
 bool            pubkey_thread_running;
+static bool     g_has_channel_api = false; /* true if DLL supports SSH channel management */
+
+/*
+ * Blank SSH login (TERMinator desktop: a phonebook entry with no saved password). Nothing is asked for: the board
+ * does its login inside the BBS (Rainwire), so the SSH layer only has to let the caller through. syncterm_macos.c
+ * sets this before every connect; 0 keeps the old behaviour. Same as the shared ssh.c (Windows/Linux, §12.61):
+ *  - user name: always BLANK_LOGIN_USER, never the entry's (with the dummy password below, a real handle would count
+ *    as a failed login for it on Rainwire). Rainwire treats "bbs" as no hint: it's in its generic names and not in
+ *    its firewall's trap names, so the password isn't checked or scored and the caller gets a clean login form
+ *  - auth: password BLANK_LOGIN_PASSWORD, which Rainwire ignores with no hint. No client key (ssh_offer_key is 0 on
+ *    the desktop), and cryptlib's client can't answer keyboard-interactive without a password
+ *  - a board that wants a real password fails at once with BLANK_LOGIN_NEEDS_CREDENTIALS, no prompt, no retry loop
+ */
+int             ssh_blank_login = 0;
+/* 0 = never load, make or offer the client key (ssh_keys.p15): TERMinator desktop, so the account that logs in is
+   always the one in the phonebook entry, never whichever account the key is registered to. 1 = SyncTERM's. */
+int             ssh_offer_key = 1;
+#define BLANK_LOGIN_USER "bbs"
+#define BLANK_LOGIN_PASSWORD "blank-login"
+#define BLANK_LOGIN_NEEDS_CREDENTIALS "This board wants an SSH username/password: tick Save credentials and enter them"
 
 void
 exit_crypt(void)
@@ -133,19 +153,23 @@ static void
 close_sftp_channel(int chan)
 {
 	assert_pthread_mutex_lock(&ssh_mutex);
-	if (chan != -1) {
-		FlushData(ssh_session);
-		if (cryptStatusOK(cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, chan))) {
-			cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, 0);
+	if (g_has_channel_api) {
+		if (chan != -1) {
+			FlushData(ssh_session);
+			if (cryptStatusOK(cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, chan))) {
+				cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, 0);
+			}
 		}
-	}
-	if (chan == sftp_channel)
-		sftp_channel = -1;
-	else {
-		FlushData(ssh_session);
-		if (cryptStatusOK(cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, sftp_channel))) {
-			cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, 0);
+		if (chan == sftp_channel)
+			sftp_channel = -1;
+		else {
+			FlushData(ssh_session);
+			if (cryptStatusOK(cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, sftp_channel))) {
+				cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, 0);
+			}
+			sftp_channel = -1;
 		}
+	} else {
 		sftp_channel = -1;
 	}
 	assert_pthread_mutex_unlock(&ssh_mutex);
@@ -157,9 +181,11 @@ close_ssh_channel(void)
 {
 	assert_pthread_mutex_lock(&ssh_mutex);
 	if (ssh_channel != -1) {
-		FlushData(ssh_session);
-		if (cryptStatusOK(cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, ssh_channel))) {
-			cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, 0);
+		if (g_has_channel_api) {
+			FlushData(ssh_session);
+			if (cryptStatusOK(cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, ssh_channel))) {
+				cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, 0);
+			}
 		}
 		ssh_channel = -1;
 	}
@@ -169,6 +195,8 @@ close_ssh_channel(void)
 static bool
 check_channel_open(int *chan)
 {
+	if (!g_has_channel_api)
+		return true;  /* No channel API — assume single channel is always open */
 	int open = 0;
 	int status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, *chan);
 	if (cryptStatusError(status)) {
@@ -262,7 +290,12 @@ ssh_input_thread(void *args)
 		popstatus = PopData(ssh_session, conn_api.rd_buf, conn_api.rd_buf_size, &rd);
 		cryptSetAttribute(ssh_session, CRYPT_OPTION_NET_READTIMEOUT, 30);
 		if (cryptStatusOK(popstatus)) {
-			gchstatus = cryptGetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, &chan);
+			if (g_has_channel_api) {
+				gchstatus = cryptGetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, &chan);
+			} else {
+				gchstatus = CRYPT_OK;
+				chan = ssh_channel;  /* single-channel mode — always channel 0 */
+			}
 		}
 		else {
 			gchstatus = CRYPT_OK;
@@ -277,7 +310,7 @@ ssh_input_thread(void *args)
 		}
 
 		// A final read on a channel just occured... figure out which is missing...
-		if (gchstatus == CRYPT_ERROR_NOTFOUND) {
+		if (gchstatus == CRYPT_ERROR_NOTFOUND && g_has_channel_api) {
 			if (ssh_channel != -1) {
 				FlushData(ssh_session);
 				status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, ssh_channel);
@@ -369,8 +402,14 @@ ssh_output_thread(void *args)
 					break;
 				}
 				FlushData(ssh_session);
-				status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, ssh_channel);
-				if (cryptStatusOK(status)) {
+				if (g_has_channel_api) {
+					status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, ssh_channel);
+					if (cryptStatusOK(status)) {
+						status = PushData(ssh_session, conn_api.wr_buf + sent, wr - sent, &ret);
+						if (cryptStatusOK(status))
+							FlushData(ssh_session);
+					}
+				} else {
 					status = PushData(ssh_session, conn_api.wr_buf + sent, wr - sent, &ret);
 					if (cryptStatusOK(status))
 						FlushData(ssh_session);
@@ -412,12 +451,16 @@ sftp_send(uint8_t *buf, size_t sz, void *cb_data)
 		int ret = 0;
 		assert_pthread_mutex_lock(&ssh_mutex);
 		FlushData(ssh_session);
-		status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, sftp_channel);
-		if (cryptStatusOK(status)) {
-			active = 0;
-			status = cryptGetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, &active);
-			if (cryptStatusOK(status) && active)
-				status = PushData(ssh_session, buf + sent, sz - sent, &ret);
+		if (g_has_channel_api) {
+			status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, sftp_channel);
+			if (cryptStatusOK(status)) {
+				active = 0;
+				status = cryptGetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_ACTIVE, &active);
+				if (cryptStatusOK(status) && active)
+					status = PushData(ssh_session, buf + sent, sz - sent, &ret);
+			}
+		} else {
+			status = PushData(ssh_session, buf + sent, sz - sent, &ret);
 		}
 		assert_pthread_mutex_unlock(&ssh_mutex);
 		if (cryptStatusError(status)) {
@@ -514,6 +557,15 @@ add_public_key(void *vpriv)
 	int active;
 	int new_sftp_channel = -1;
 	char *priv = vpriv;
+
+	/* SFTP key upload requires multi-channel support.
+	 * Stock cryptlib doesn't have it — just skip. */
+	if (!g_has_channel_api) {
+		fprintf(stderr, "[SSH] Channel API not available — skipping SFTP public key upload\n");
+		free(priv);
+		pubkey_thread_running = false;
+		return;
+	}
 
 	// Wait for at most five seconds for channel to be fully active
 	active = 0;
@@ -710,58 +762,65 @@ ssh_connect(struct bbslist *bbs)
 	assert_pthread_mutex_unlock(&ssh_mutex);
 	assert_pthread_mutex_init(&ssh_tx_mutex, NULL);
 
-	get_syncterm_filename(path, sizeof(path), SYNCTERM_PATH_KEYS, false);
-	if(cryptStatusOK(cryptKeysetOpen(&ssh_keyset, CRYPT_UNUSED, CRYPT_KEYSET_FILE, path, CRYPT_KEYOPT_READONLY))) {
-		status = cryptGetPrivateKey(ssh_keyset, &ssh_context, CRYPT_KEYID_NAME, KEY_LABEL, KEY_PASSWORD);
-		if(cryptStatusError(status)) {
-			error_popup(bbs, "creating context", status);
-		}
-		if (cryptStatusError(cryptKeysetClose(ssh_keyset))) {
-			error_popup(bbs, "closing keyset", status);
-		}
-	}
-	else {
-		do {
-			/* Couldn't do that... create a new context and use the key from there... */
-			status = cryptCreateContext(&ssh_context, CRYPT_UNUSED, CRYPT_ALGO_RSA);
-			if (cryptStatusError(status)) {
-				error_popup(bbs, "creating context", status);
-				break;
-			}
-			status = cryptSetAttributeString(ssh_context, CRYPT_CTXINFO_LABEL, KEY_LABEL, strlen(KEY_LABEL));
-			if (cryptStatusError(status)) {
-				error_popup(bbs, "setting label", status);
-				break;
-			}
-			status = cryptGenerateKey(ssh_context);
-			if (cryptStatusError(status)) {
-				error_popup(bbs, "generating key", status);
-				break;
-			}
-
-			/* Ok, now try saving this one... use the syspass to encrypt it. */
-			status = cryptKeysetOpen(&ssh_keyset, CRYPT_UNUSED, CRYPT_KEYSET_FILE, path, CRYPT_KEYOPT_CREATE);
-			if (cryptStatusError(status)) {
-				error_popup(bbs, "creating keyset", status);
-				break;
-			}
-			status = cryptAddPrivateKey(ssh_keyset, ssh_context, KEY_PASSWORD);
-			if (cryptStatusError(status)) {
-				cryptKeysetClose(ssh_keyset);
-				error_popup(bbs, "adding private key", status);
-				break;
-			}
-			status = cryptKeysetClose(ssh_keyset);
-			if (cryptStatusError(status)) {
-				error_popup(bbs, "closing keyset", status);
-				break;
-			}
-		} while(0);
-	}
-	if (cryptStatusError(status)) {
-		fprintf(stderr, "[SSH] Key management failed (status=%d), will try password auth\n", status);
-		cryptDestroyContext(ssh_context);
+	if (!ssh_offer_key) {
+		/* No client key at all: password (or blank login) only */
 		ssh_context = -1;
+		status = CRYPT_OK;
+		fprintf(stderr, "[SSH] Client key not offered (ssh_offer_key=0)\n");
+	} else {
+		get_syncterm_filename(path, sizeof(path), SYNCTERM_PATH_KEYS, false);
+		if(cryptStatusOK(cryptKeysetOpen(&ssh_keyset, CRYPT_UNUSED, CRYPT_KEYSET_FILE, path, CRYPT_KEYOPT_READONLY))) {
+			status = cryptGetPrivateKey(ssh_keyset, &ssh_context, CRYPT_KEYID_NAME, KEY_LABEL, KEY_PASSWORD);
+			if(cryptStatusError(status)) {
+				error_popup(bbs, "creating context", status);
+			}
+			if (cryptStatusError(cryptKeysetClose(ssh_keyset))) {
+				error_popup(bbs, "closing keyset", status);
+			}
+		}
+		else {
+			do {
+				/* Couldn't do that... create a new context and use the key from there... */
+				status = cryptCreateContext(&ssh_context, CRYPT_UNUSED, CRYPT_ALGO_RSA);
+				if (cryptStatusError(status)) {
+					error_popup(bbs, "creating context", status);
+					break;
+				}
+				status = cryptSetAttributeString(ssh_context, CRYPT_CTXINFO_LABEL, KEY_LABEL, strlen(KEY_LABEL));
+				if (cryptStatusError(status)) {
+					error_popup(bbs, "setting label", status);
+					break;
+				}
+				status = cryptGenerateKey(ssh_context);
+				if (cryptStatusError(status)) {
+					error_popup(bbs, "generating key", status);
+					break;
+				}
+
+				/* Ok, now try saving this one... use the syspass to encrypt it. */
+				status = cryptKeysetOpen(&ssh_keyset, CRYPT_UNUSED, CRYPT_KEYSET_FILE, path, CRYPT_KEYOPT_CREATE);
+				if (cryptStatusError(status)) {
+					error_popup(bbs, "creating keyset", status);
+					break;
+				}
+				status = cryptAddPrivateKey(ssh_keyset, ssh_context, KEY_PASSWORD);
+				if (cryptStatusError(status)) {
+					cryptKeysetClose(ssh_keyset);
+					error_popup(bbs, "adding private key", status);
+					break;
+				}
+				status = cryptKeysetClose(ssh_keyset);
+				if (cryptStatusError(status)) {
+					error_popup(bbs, "closing keyset", status);
+					break;
+				}
+			} while(0);
+		}
+		if (cryptStatusError(status)) {
+			fprintf(stderr, "[SSH] Key management failed (status=%d), will try password auth\n", status);
+			cryptDestroyContext(ssh_context);
+			ssh_context = -1;
+		}
 	}
 
 	// Key management errors are recoverable (password auth still works).
@@ -780,10 +839,10 @@ ssh_connect(struct bbslist *bbs)
 	if (!bbs->hidepopups)
 		uifc.pop("Connecting...");
 	ssh_sock = conn_socket_connect(bbs, true);
-	if (ssh_sock == INVALID_SOCKET) {
-		ssh_close();
+	/* conn_socket_connect() already ran conn_close() -> ssh_close() on failure,
+	   which destroyed ssh_mutex; a second ssh_close() asserts on the dead mutex. */
+	if (ssh_sock == INVALID_SOCKET)
 		return -1;
-	}
 	fprintf(stderr, "[SSH] Socket connected (fd=%d)\n", ssh_sock);
 
 	/* Disable Nagle for interactive use */
@@ -799,6 +858,13 @@ ssh_connect(struct bbslist *bbs)
 
 	SAFECOPY(password, bbs->password);
 	SAFECOPY(username, bbs->user);
+	if (ssh_blank_login) {
+		/* Blank login: never prompt (see ssh_blank_login). Always the neutral name: a real handle with the dummy
+		   password would be a failed login for that handle. */
+		SAFECOPY(username, BLANK_LOGIN_USER);
+		SAFECOPY(password, BLANK_LOGIN_PASSWORD);
+		fprintf(stderr, "[SSH] Blank login (user '%s', ignored password)\n", username);
+	}
 	fprintf(stderr, "[SSH] Auth: username='%s', password=%s, has_key=%d\n",
 	       username, password[0] ? "(set)" : "(empty)", ssh_context != -1);
 
@@ -874,9 +940,23 @@ ssh_connect(struct bbslist *bbs)
 		uifc.pop("Setting Username");
 	}
 
-	/* cryptlib 3.4.9 hardcodes terminal type ("xterm") and size (80x48)
-	   in the pty-req during session activation. Channel attributes for
-	   customizing these were removed from the API. */
+	/* Stock cryptlib sends a hardcoded terminal type ("xterm") and size (80x48) in the pty-req. The SyncTERM
+	 * fork we link (and Windows) takes them from channel attributes set before activation, so the board sees
+	 * our real screen size: without this a board that sizes itself from the pty-req centres for 48 rows and
+	 * draws past the bottom of our 25. Stock cryptlib refuses SSH_CHANNEL here, and keeps its defaults. */
+	status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, CRYPT_UNUSED);
+	if (cryptStatusOK(status)) {
+		int rows, cols;
+		/* What Windows sends (bbslist.c get_emulation_str): the entry's terminal name, else "syncterm" */
+		const char *term = bbs->term_name[0] ? bbs->term_name : "syncterm";
+		cryptSetAttributeString(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_TERMINAL, term, strlen(term));
+		get_term_win_size(&cols, &rows, NULL, NULL, &bbs->nostatus);
+		cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_WIDTH, cols);
+		cryptSetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL_HEIGHT, rows);
+		fprintf(stderr, "[SSH] pty-req: %s %dx%d\n", term, cols, rows);
+	} else {
+		fprintf(stderr, "[SSH] SSH_CHANNEL not supported before activation (status=%d) - default pty-req\n", status);
+	}
 
 	cryptSetAttribute(ssh_session, CRYPT_OPTION_NET_READTIMEOUT, 30);
 	cryptSetAttribute(ssh_session, CRYPT_OPTION_NET_WRITETIMEOUT, 30);
@@ -890,6 +970,11 @@ ssh_connect(struct bbslist *bbs)
 
 	do {
 		status = cryptSetAttribute(ssh_session, CRYPT_SESSINFO_ACTIVE, 1);
+		if (status == CRYPT_ENVELOPE_RESOURCE && ssh_blank_login) {
+			/* Blank login has nothing more to offer: fail below, no prompt */
+			fprintf(stderr, "[SSH] Server wants more auth — blank login gives up\n");
+			break;
+		}
 		if (status == CRYPT_ENVELOPE_RESOURCE) {
 			fprintf(stderr, "[SSH] Server requested password (CRYPT_ENVELOPE_RESOURCE)\n");
 			if (bbs->hidepopups) {
@@ -919,6 +1004,10 @@ ssh_connect(struct bbslist *bbs)
 	} while (status == CRYPT_ENVELOPE_RESOURCE);
 	if (cryptStatusError(status)) {
 		fprintf(stderr, "[SSH] Session activation FAILED (status=%d)\n", status);
+		/* Blank login refused at the auth stage: say what to do (macos_stubs.c logs uifcmsg for the app) */
+		if (ssh_blank_login && (status == CRYPT_ENVELOPE_RESOURCE || status == CRYPT_ERROR_NOTINITED
+		    || status == CRYPT_ERROR_WRONGKEY || status == CRYPT_ERROR_PERMISSION))
+			uifcmsg(BLANK_LOGIN_NEEDS_CREDENTIALS, NULL);
 		free(pubkey);
 		error_popup(bbs, "activating session", status);
 		ssh_close();
@@ -946,15 +1035,18 @@ ssh_connect(struct bbslist *bbs)
 	// Using ssh_channel outside of ssh_mutex (which doesn't exist yet)
 	/* coverity[missing_lock:SUPPRESS] */
 	status = cryptGetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, &ssh_channel);
-	if (cryptStatusError(status) || ssh_channel == -1) {
-		free(pubkey);
-		error_popup(bbs, "getting ssh channel", status);
-		ssh_close();
-		return -1;
+	if (cryptStatusError(status)) {
+		/* Stock cryptlib without channel management — use default channel 0 */
+		ssh_channel = 0;
+		g_has_channel_api = false;
+		fprintf(stderr, "[SSH] SSH_CHANNEL not available — using default channel 0\n");
+	} else {
+		g_has_channel_api = true;
+		fprintf(stderr, "[SSH] SSH channel acquired (channel=%d)\n", ssh_channel);
 	}
 
 	memset(server_fp, 0, sizeof(server_fp));
-	status = cryptGetAttributeString(ssh_session, CRYPT_SESSINFO_SERVER_FINGERPRINT_SHA2, server_fp, &slen);
+	status = cryptGetAttributeString(ssh_session, CRYPT_SESSINFO_SERVER_FINGERPRINT_SHA1, server_fp, &slen);
 	if (cryptStatusOK(status)) {
 		if (memcmp(bbs->ssh_fingerprint, server_fp, sizeof(server_fp))) {
 			static const char * const opts[4] = {"Disconnect", "Update", "Ignore", ""};

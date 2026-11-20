@@ -283,6 +283,9 @@ typedef struct {
 
 	/* Configuration */
 	BOOL escape_telnet_iac;
+	BOOL escape_cr;     /* TERMinator 2026-10-09: escape EVERY CR (ZDLE 'M'), not just "@ CR": some boards' telnet code
+	                     * (reached over telnet or behind their SSH) mangles a raw CR, failing every block holding
+	                     * one. Every receiver decodes ZDLE escapes, asked for or not. Off by default. */
 	unsigned init_timeout;
 	unsigned send_timeout;
 	unsigned recv_timeout;

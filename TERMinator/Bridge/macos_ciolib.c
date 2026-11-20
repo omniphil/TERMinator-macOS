@@ -14,7 +14,19 @@
 #include "safe_math.h"
 #include "macos_ciolib.h"
 #include "ciolib.h"
-#include "vidmodes.h"
+#include "apc/pic_bridge.h"   /* Rainwire's TERMinator:Pic pictures go with a full screen clear */
+/*
+ * The REAL vidmodes.h, not the stale stub next door.
+ *
+ * ⚠️ Bridge/vidmodes.h is a cut-down copy whose `struct video_params` is missing
+ * fields the shipped one has (curs_start / curs_end / default_attr / aspect_* /
+ * xres / yres), and it declares neither vparams[] nor NUMMODES. Because this file
+ * lives in Bridge/, a plain #include "vidmodes.h" resolves to that stub by the
+ * same-directory rule and shadows the good header. Spell the path out so we bind to
+ * the table cterm actually uses — the struct layouts differ, so reading vparams[]
+ * through the stub would be garbage.
+ */
+#include "conio/vidmodes.h"
 
 // Maximum terminal dimensions to prevent unreasonable allocations
 #define MAX_TERMINAL_WIDTH  1000
@@ -46,6 +58,9 @@ extern struct conio_font_data_struct conio_fontdata[257];
 // Declared in syncterm_ios.c — saves one line into the scrollback ring buffer.
 extern void scrollback_save_line(const struct vmem_cell *line, int width);
 
+// Current font ID — defined in syncterm_macos.c, updated by setfont callback
+extern int g_current_font_id;
+
 // iOS-specific screen state
 static struct ios_screen_state {
     struct vmem_cell *screen;
@@ -76,7 +91,21 @@ static struct ios_screen_state {
     int pixel_height;          // Buffer height in pixels
     int pixel_dirty;           // New data since last read
     int pixel_has_data;        // ANY sixel data has been written
+    // Changed-pixel rectangle since the app last copied the layer (inclusive; x1 < x0 = none recorded,
+    // so a dirty layer with no rectangle copies whole). Windows wpf_ciolib.c, 2026-09-15.
+    int pixel_dirty_x0;
+    int pixel_dirty_y0;
+    int pixel_dirty_x1;
+    int pixel_dirty_y1;
     int char_pixel_height;     // Character cell height in pixels (e.g. 16 for 8x16 font)
+    // Scanline-based cursor state (matching bitmap_con.c)
+    int curs_start;            // Top scanline of cursor within cell
+    int curs_end;              // Bottom scanline of cursor within cell
+    int curs_blinks;           // Whether cursor blinks (1=yes, 0=steady)
+    int default_curs_start;    // Default curs_start for _NORMALCURSOR
+    int default_curs_end;      // Default curs_end for _NORMALCURSOR
+    // macOS PETSCII 2026-09-04
+    int vmode_override;        // Explicit ciolib video mode (C64_40X25 etc.), -1 = derive from geometry
 } ios_state = {
     .screen = NULL,
     .width = 80,
@@ -118,8 +147,16 @@ static struct ios_screen_state {
     .pixel_width = 0,
     .pixel_height = 0,
     .pixel_dirty = 0,
+    .pixel_dirty_x1 = -1,
+    .pixel_dirty_y1 = -1,
     .pixel_has_data = 0,
-    .char_pixel_height = 0
+    .char_pixel_height = 0,
+    .curs_start = 14,
+    .curs_end = 15,
+    .curs_blinks = 1,
+    .default_curs_start = 14,
+    .default_curs_end = 15,
+    .vmode_override = -1   // macOS PETSCII 2026-09-04
 };
 
 // Forward declarations
@@ -139,6 +176,8 @@ static void ios_gotoxy(int x, int y);
 static void ios_clrscr(void);
 static void ios_gettextinfo(struct text_info *info);
 static void ios_setcursortype(int type);
+static int ios_current_vmode(void);
+static void ios_apply_mode_cursor_locked(void);
 static int ios_getch(void);
 static int ios_getche(void);
 static void ios_beep(void);
@@ -193,7 +232,12 @@ int macos_ciolib_get_cursor_y(void) {
 }
 
 bool macos_ciolib_is_cursor_visible(void) {
-    return ios_state.cursor_visible && ios_state.cursor_type != _NOCURSOR;
+    /* Match cursor_visible_locked() from bitmap_con.c:383-396 */
+    if (!ios_state.cursor_visible)
+        return false;
+    if (ios_state.curs_start > ios_state.curs_end)
+        return false;
+    return true;  /* Blink phase handled in Swift timer */
 }
 
 bool macos_ciolib_cursor_type_changed(void) {
@@ -202,6 +246,59 @@ bool macos_ciolib_cursor_type_changed(void) {
     ios_state.cursor_type_changed = 0;
     pthread_mutex_unlock(&ios_state.mutex);
     return changed;
+}
+
+int macos_ciolib_get_cursor_type(void) {
+    return ios_state.cursor_type;
+}
+
+int macos_ciolib_get_cursor_start(void) {
+    return ios_state.curs_start;
+}
+
+int macos_ciolib_get_cursor_end(void) {
+    return ios_state.curs_end;
+}
+
+int macos_ciolib_get_cursor_blinks(void) {
+    return ios_state.curs_blinks;
+}
+
+/* Resolve ciolib_fg to an RGB color, matching color_value() in bitmap_con.c. */
+uint32_t macos_ciolib_get_fg_color(void) {
+    uint32_t col = ciolib_fg;
+    if (col & 0x80000000u)  /* CIOLIB_COLOR_RGB */
+        return col & 0x00FFFFFFu;
+    uint32_t idx = col & 0x00FFFFFFu;
+    if (idx < sizeof(ios_state.palette) / sizeof(ios_state.palette[0]))
+        return ios_state.palette[idx] & 0x00FFFFFFu;
+    return ios_state.palette[7] & 0x00FFFFFFu;  /* fallback: light gray */
+}
+
+int macos_ciolib_get_char_pixel_height(void) {
+    return ios_state.char_pixel_height;
+}
+
+void macos_ciolib_set_custom_cursor(int s, int e, int r, int b, int v) {
+    double ratio;
+
+    pthread_mutex_lock(&ios_state.mutex);
+    if (r == 0)
+        ratio = 1;
+    else {
+        int charh = ios_state.char_pixel_height > 0 ? ios_state.char_pixel_height : 16;
+        ratio = charh / r;  /* integer division, matching bitmap_con.c exactly */
+    }
+    if (s >= 0)
+        ios_state.curs_start = (int)(s * ratio);
+    if (e >= 0)
+        ios_state.curs_end = (int)(e * ratio);
+    if (b >= 0)
+        ios_state.curs_blinks = b;
+    if (v >= 0)
+        ios_state.cursor_visible = v;
+    ios_state.dirty = 1;
+    pthread_mutex_unlock(&ios_state.mutex);
 }
 
 bool macos_ciolib_is_dirty(void) {
@@ -276,6 +373,39 @@ uint32_t* macos_ciolib_get_palette(void) {
 // Sixel pixel framebuffer functions
 // ============================================================================
 
+// Grow the changed-pixel rectangle (inclusive pixel coordinates) and flag the layer dirty.
+// Caller holds the state mutex.
+static void mark_pixels_dirty(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 < x0 || y1 < y0)
+        return;
+    if (ios_state.pixel_dirty_x1 < ios_state.pixel_dirty_x0) {
+        ios_state.pixel_dirty_x0 = x0;
+        ios_state.pixel_dirty_y0 = y0;
+        ios_state.pixel_dirty_x1 = x1;
+        ios_state.pixel_dirty_y1 = y1;
+    } else {
+        if (x0 < ios_state.pixel_dirty_x0) ios_state.pixel_dirty_x0 = x0;
+        if (y0 < ios_state.pixel_dirty_y0) ios_state.pixel_dirty_y0 = y0;
+        if (x1 > ios_state.pixel_dirty_x1) ios_state.pixel_dirty_x1 = x1;
+        if (y1 > ios_state.pixel_dirty_y1) ios_state.pixel_dirty_y1 = y1;
+    }
+    ios_state.pixel_dirty = 1;
+}
+
+static void mark_all_pixels_dirty(void) {
+    mark_pixels_dirty(0, 0, 0x3FFFFFFF, 0x3FFFFFFF);   /* clamped to the buffer when copied */
+}
+
+static void reset_pixels_dirty(void) {
+    ios_state.pixel_dirty = 0;
+    ios_state.pixel_dirty_x0 = 0;
+    ios_state.pixel_dirty_y0 = 0;
+    ios_state.pixel_dirty_x1 = -1;
+    ios_state.pixel_dirty_y1 = -1;
+}
+
 // Lazy allocate/grow pixel buffer to at least w x h
 // Must be called with mutex held
 static void ensure_pixel_buffer(int w, int h) {
@@ -314,6 +444,7 @@ static void ensure_pixel_buffer(int w, int h) {
     ios_state.pixel_buffer = new_buf;
     ios_state.pixel_width = new_w;
     ios_state.pixel_height = new_h;
+    mark_all_pixels_dirty();   /* new size: the app re-creates its copy and takes everything */
 }
 
 // Resolve a ciolib color value to 0xAARRGGBB
@@ -340,7 +471,7 @@ void macos_ciolib_clear_pixels(void) {
         if (safe_mult_size((size_t)ios_state.pixel_width, (size_t)ios_state.pixel_height, &buf_size)) {
             memset(ios_state.pixel_buffer, 0, buf_size * sizeof(uint32_t));
         }
-        ios_state.pixel_dirty = 1;
+        mark_all_pixels_dirty();
         ios_state.pixel_has_data = 0;
     }
     pthread_mutex_unlock(&ios_state.mutex);
@@ -349,6 +480,42 @@ void macos_ciolib_clear_pixels(void) {
 // Set the character cell pixel height (e.g. 16 for 8x16 font)
 void macos_ciolib_set_char_pixel_height(int h) {
     ios_state.char_pixel_height = h;
+    /* Cursor scanlines are relative to the cell — a new cell height retargets them. */
+    macos_ciolib_apply_mode_cursor();
+}
+
+// Blit a raw ARGB pixel buffer to the screen pixel buffer at (dst_x, dst_y)
+void macos_ciolib_blit_sixel(const uint32_t *src, int dst_x, int dst_y, int w, int h) {
+    if (!src || w <= 0 || h <= 0) return;
+
+    pthread_mutex_lock(&ios_state.mutex);
+    ensure_pixel_buffer(dst_x + w, dst_y + h);
+
+    if (!ios_state.pixel_buffer) {
+        pthread_mutex_unlock(&ios_state.mutex);
+        return;
+    }
+
+    int buf_w = ios_state.pixel_width;
+    int buf_h = ios_state.pixel_height;
+
+    for (int row = 0; row < h; row++) {
+        int dy = dst_y + row;
+        if (dy < 0) continue;
+        if (dy >= buf_h) break;
+        int copy_w = w;
+        if (dst_x + copy_w > buf_w) copy_w = buf_w - dst_x;
+        if (dst_x < 0) continue;
+        if (copy_w <= 0) continue;
+        memcpy(ios_state.pixel_buffer + dy * buf_w + dst_x,
+               src + row * w,
+               copy_w * sizeof(uint32_t));
+    }
+
+    mark_pixels_dirty(dst_x, dst_y, dst_x + w - 1 < buf_w ? dst_x + w - 1 : buf_w - 1,
+                      dst_y + h - 1 < buf_h ? dst_y + h - 1 : buf_h - 1);
+    ios_state.pixel_has_data = 1;
+    pthread_mutex_unlock(&ios_state.mutex);
 }
 
 // Sixel setpixels implementation - called from cterm.c via ciolib_setpixels()
@@ -385,8 +552,11 @@ int macos_ciolib_setpixels(uint32_t sx, uint32_t sy, uint32_t ex, uint32_t ey,
                 uint32_t mask_x = dst_x - sx + mx_off;
                 uint32_t mask_y = dst_y - sy + my_off;
                 if (mask_x < mask->width && mask_y < mask->height) {
-                    uint32_t mask_byte_idx = mask_y * ((mask->width + 7) / 8) + mask_x / 8;
-                    uint8_t mask_bit = 0x80 >> (mask_x % 8);
+                    /* One continuous bit run across the whole mask, as cterm's sixel mask, the APC PBM decoder
+                     * and upstream bitmap_con.c write it (rows don't start on a fresh byte). */
+                    size_t mask_pos = (size_t)mask_y * mask->width + mask_x;
+                    size_t mask_byte_idx = mask_pos / 8;
+                    uint8_t mask_bit = 0x80 >> (mask_pos % 8);
                     if (!(mask->bits[mask_byte_idx] & mask_bit)) {
                         continue;  // Mask bit clear: skip this pixel
                     }
@@ -399,7 +569,9 @@ int macos_ciolib_setpixels(uint32_t sx, uint32_t sy, uint32_t ex, uint32_t ey,
         }
     }
 
-    ios_state.pixel_dirty = 1;
+    mark_pixels_dirty((int)sx, (int)sy,
+                      (int)ex < buf_w ? (int)ex : buf_w - 1,
+                      (int)ey < buf_h ? (int)ey : buf_h - 1);
     ios_state.pixel_has_data = 1;
     pthread_mutex_unlock(&ios_state.mutex);
     return 1;
@@ -415,7 +587,72 @@ int macos_ciolib_is_pixel_dirty(void) {
 }
 
 void macos_ciolib_clear_pixel_dirty(void) {
-    ios_state.pixel_dirty = 0;
+    reset_pixels_dirty();
+}
+
+// Copy the layer's changed rectangle straight into dest (dest_w x dest_h ARGB, dest_stride pixels per row)
+// and clear the dirty state; full copies everything. Returns the pixels copied, 0 when there is nothing to
+// copy, or -1 when dest isn't the layer's size (nothing copied, still dirty). *bw x *bh is always the size.
+// Windows wpf_ciolib_copy_dirty_pixels, 2026-09-15.
+int macos_ciolib_copy_dirty_pixels(uint32_t *dest, int dest_w, int dest_h, int dest_stride, int full,
+                                   int *x, int *y, int *w, int *h, int *bw, int *bh) {
+    int ret = 0;
+    int pw;
+    int ph;
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+
+    pthread_mutex_lock(&ios_state.mutex);
+    pw = ios_state.pixel_width;
+    ph = ios_state.pixel_height;
+    *bw = pw;
+    *bh = ph;
+    *x = *y = *w = *h = 0;
+    if (ios_state.pixel_buffer == NULL || !ios_state.pixel_has_data || pw <= 0 || ph <= 0) {
+        /* Nothing to show (the app drops its overlay): clear the flag, or a redraw is asked for every cycle */
+        reset_pixels_dirty();
+        goto done;
+    }
+    if (dest == NULL)
+        goto done;
+    if (dest_w != pw || dest_h != ph || dest_stride < pw) {
+        ret = -1;
+        goto done;
+    }
+    if (!full && !ios_state.pixel_dirty)
+        goto done;
+
+    x0 = 0;
+    y0 = 0;
+    x1 = pw - 1;
+    y1 = ph - 1;
+    if (!full && ios_state.pixel_dirty_x1 >= ios_state.pixel_dirty_x0
+        && ios_state.pixel_dirty_y1 >= ios_state.pixel_dirty_y0) {
+        if (ios_state.pixel_dirty_x0 > x0) x0 = ios_state.pixel_dirty_x0;
+        if (ios_state.pixel_dirty_y0 > y0) y0 = ios_state.pixel_dirty_y0;
+        if (ios_state.pixel_dirty_x1 < x1) x1 = ios_state.pixel_dirty_x1;
+        if (ios_state.pixel_dirty_y1 < y1) y1 = ios_state.pixel_dirty_y1;
+    }
+    if (x1 >= x0 && y1 >= y0) {
+        int rw = x1 - x0 + 1;
+        for (int row = y0; row <= y1; row++) {
+            memcpy(dest + (size_t)row * (size_t)dest_stride + (size_t)x0,
+                   ios_state.pixel_buffer + (size_t)row * (size_t)pw + (size_t)x0,
+                   (size_t)rw * sizeof(uint32_t));
+        }
+        *x = x0;
+        *y = y0;
+        *w = rw;
+        *h = y1 - y0 + 1;
+        ret = rw * (y1 - y0 + 1);
+    }
+    reset_pixels_dirty();
+
+done:
+    pthread_mutex_unlock(&ios_state.mutex);
+    return ret;
 }
 
 uint32_t* macos_ciolib_get_pixel_buffer(void) {
@@ -461,6 +698,71 @@ void macos_ciolib_push_input_buffer(const unsigned char *buf, int len) {
 // MARK: - Implementation Functions
 // ============================================================================
 
+/*
+ * ---- Sixel pixel-layer clearing for PARTIAL erases -------------------------
+ *
+ * Sixel graphics live in their own ARGB framebuffer (pixel_buffer) that is
+ * composited over the text grid; the text cells in `screen` know nothing about
+ * them. Until 2026-08-17 the ONLY thing that ever cleared that framebuffer was
+ * clrscr(), i.e. ESC[2J. Every PARTIAL erase — ESC[J / ESC[0J (erase below),
+ * ESC[1J (erase above) and ESC[K in all its forms — clears cterm's text cells
+ * through clreol()/clear2bol() and never touched the pixels, so sixel images
+ * stayed on screen as ghosts underneath the fresh text.
+ *
+ * That asymmetry is why this only reproduced on some boards: Synchronet clears
+ * with ESC[2J and happened to hit the one path that worked, while Mystic uses
+ * the erase-below form and left its sixels behind on every screen change.
+ *
+ * Cell geometry comes from the same 8 x char_pixel_height cell the sixel
+ * decoder uses to place its origin, so the rectangle wiped here can never
+ * drift away from where setpixels() actually wrote.
+ */
+static void ios_cell_pixel_size(int *cwp, int *chp) {
+    /* Must mirror sixel_begin() in syncterm_stubs.c EXACTLY: that is the only
+     * code that turns text coords into pixel coords for this framebuffer, and
+     * it uses a fixed 8px advance with the live char cell height. Deriving the
+     * geometry any other way lets the wiped rectangle drift off the pixels that
+     * were actually written. */
+    int ch = ios_state.char_pixel_height;
+    if (cwp) *cwp = 8;
+    if (chp) *chp = (ch > 0) ? ch : 16;
+}
+
+/* Wipe the sixel pixels under a rectangle of TEXT CELLS (1-based, inclusive).
+ * Caller must already hold the state mutex.
+ *
+ * NOTE: pixel_has_data is deliberately left SET — pixels may well survive
+ * outside this rectangle, and only a full clear may claim the layer is empty. */
+static void ios_clear_pixel_cells(int sx, int sy, int ex, int ey) {
+    if (ios_state.pixel_buffer == NULL || !ios_state.pixel_has_data)
+        return;
+
+    int cw, ch;
+    ios_cell_pixel_size(&cw, &ch);
+
+    long px0 = (long)(sx - 1) * cw;
+    long py0 = (long)(sy - 1) * ch;
+    long px1 = (long)ex * cw - 1;
+    long py1 = (long)ey * ch - 1;
+
+    if (px0 < 0) px0 = 0;
+    if (py0 < 0) py0 = 0;
+    if (px1 > (long)ios_state.pixel_width - 1)  px1 = (long)ios_state.pixel_width - 1;
+    if (py1 > (long)ios_state.pixel_height - 1) py1 = (long)ios_state.pixel_height - 1;
+    if (px1 < px0 || py1 < py0)
+        return;
+
+    for (long yy = py0; yy <= py1; yy++) {
+        memset(ios_state.pixel_buffer + (size_t)yy * (size_t)ios_state.pixel_width + (size_t)px0,
+               0, (size_t)(px1 - px0 + 1) * sizeof(uint32_t));
+    }
+    mark_pixels_dirty((int)px0, (int)py0, (int)px1, (int)py1);
+}
+
+/* Set by ios_movetext around its text copy: moving text isn't writing it, and the pixel layer moves on its
+ * own there, so the pixels under the destination must survive. */
+static int g_moving_text = 0;
+
 static void ios_clreol(void) {
     pthread_mutex_lock(&ios_state.mutex);
     ios_state.pending_wrap = 0;
@@ -480,6 +782,8 @@ static void ios_clreol(void) {
             ios_state.screen[idx].flags = ios_state.current_flags;
         }
         mark_region_dirty(x, y, ios_state.width - 1, y);
+        /* An erase drops the graphics under it too, not just the text. */
+        ios_clear_pixel_cells(x + 1, y + 1, ios_state.width, y + 1);
     }
     pthread_mutex_unlock(&ios_state.mutex);
 }
@@ -531,10 +835,24 @@ static int ios_puttext(int sx, int sy, int ex, int ey, void *buf) {
 
                 ios_state.screen[idx].ch = src[src_offset];
                 ios_state.screen[idx].legacy_attr = src[src_offset + 1];
+                /* ⚠️ Derive fg/bg here — do NOT leave them at whatever the cell held.
+                 *
+                 * This is the legacy char/attr entry point. Leaving fg/bg alone does NOT leave
+                 * them at zero: clrscr() and putch() write fg_color/bg_color into every cell they
+                 * touch, so the cell keeps a STALE colour and the packing code's
+                 * `if (fg_raw != 0) use it` branch then renders the whole thing in that one
+                 * colour. That is what made PETSCII come out monochrome on Android and iOS
+                 * (2026-09-04). macOS has no PETSCII yet — this is the same fix applied ahead of
+                 * the real-cterm migration, which is what will start routing content through here. */
+                ios_state.screen[idx].fg = src[src_offset + 1] & 0x0F;
+                ios_state.screen[idx].bg = (src[src_offset + 1] >> 4) & 0x0F;
                 ios_state.screen[idx].flags = 0;
             }
         }
         mark_region_dirty(sx - 1, sy - 1, ex - 1, ey - 1);
+        /* Text written over graphics replaces them, as in SyncTERM's single framebuffer */
+        if (!g_moving_text)
+            ios_clear_pixel_cells(sx, sy, ex, ey);
     }
     pthread_mutex_unlock(&ios_state.mutex);
     return 1;
@@ -570,6 +888,9 @@ static int ios_vmem_puttext(int sx, int sy, int ex, int ey, struct vmem_cell *bu
             }
         }
         mark_region_dirty(sx - 1, sy - 1, ex - 1, ey - 1);
+        /* Text written over graphics replaces them, as in SyncTERM's single framebuffer */
+        if (!g_moving_text)
+            ios_clear_pixel_cells(sx, sy, ex, ey);
     }
     pthread_mutex_unlock(&ios_state.mutex);
     return 1;
@@ -709,6 +1030,16 @@ static int ios_wherey(void) {
 }
 
 static int ios_putch(int c) {
+    // ⚠️ BEL is a beep, never a glyph. cterm's ANSI BEL handler calls putch(7) here
+    // (this copy's `#if defined(__unix__) || defined(__APPLE__)`), expecting ciolib to
+    // beep the way the real ciolib_putch does. Drawing it wrote char 7 into the cell AND
+    // advanced the cursor, so every BEL pushed the rest of the line one column right
+    // (aBSiNTHE's "Three new messages posted!" landed a cell past its leading T). The
+    // sound already comes from the 0x07 scan in syncterm_macos.c (g_bell_detected).
+    // Same fix as Android's android_putch and Linux's linux_putch (2026-09-16).
+    if (c == 7)
+        return c;
+
     // Flag: if deferred wrap needs a scroll, we must save the top line
     // to scrollback AFTER releasing ios_state.mutex (to avoid deadlock).
     int need_scroll = 0;
@@ -771,6 +1102,7 @@ static int ios_putch(int c) {
             ios_state.screen[idx].font = 0;
             ios_state.screen[idx].flags = ios_state.current_flags;
             mark_cell_dirty(x, y);
+            ios_clear_pixel_cells(x + 1, y + 1, x + 1, y + 1);  /* text replaces graphics under it */
 
             ios_state.cursor_x++;
             if (ios_state.cursor_x > ios_state.width) {
@@ -853,10 +1185,12 @@ static void ios_clrscr(void) {
                 if (safe_mult_size((size_t)ios_state.pixel_width, (size_t)ios_state.pixel_height, &buf_size)) {
                     memset(ios_state.pixel_buffer, 0, buf_size * sizeof(uint32_t));
                 }
-                ios_state.pixel_dirty = 1;
+                mark_all_pixels_dirty();
                 ios_state.pixel_has_data = 0;
             }
         }
+        // ...and Rainwire's TERMinator:Pic pictures, in stream order with the commands around it (apc/pic_bridge.c)
+        pic_screen_cleared();
         mark_screen_dirty();
     }
     pthread_mutex_unlock(&ios_state.mutex);
@@ -871,11 +1205,118 @@ static void ios_gettextinfo(struct text_info *info) {
     info->winbottom = ios_state.height;
     info->attribute = ios_state.current_attr;
     info->normattr = 7;
-    info->currmode = C80;
+    /* The real mode, as Windows reports: cterm sizes and places sixel / APC images and picks the Commodore colour
+       tables from currmode, so a fixed C80 misplaced graphics in 80x43/80x50/132-column modes */
+    info->currmode = ios_current_vmode();
     info->screenheight = ios_state.height;
     info->screenwidth = ios_state.width;
     info->curx = ios_state.cursor_x;
     info->cury = ios_state.cursor_y;
+    pthread_mutex_unlock(&ios_state.mutex);
+}
+
+/* Which vparams row are we actually running?
+ *
+ * Look the mode up by the dimensions in use; when the loaded font's height is known
+ * prefer an entry that also matches it, which disambiguates modes sharing a geometry
+ * (e.g. C80X50 vs C4350). vparams is the very table cterm reads, so this mapping
+ * cannot drift away from it. Falls back to C80 if nothing matches.
+ *
+ * The caller must already hold ios_state.mutex; this reads state without taking it,
+ * because the pthread mutex here is not recursive.
+ */
+static int ios_current_vmode(void) {
+    int cols = ios_state.width;
+    int rows = ios_state.height;
+    int charh = ios_state.char_pixel_height;
+    int best = -1;
+
+    /* macOS PETSCII 2026-09-04: an explicit mode (Commodore/Atari emulation) wins over
+       geometry inference — 40x25 with an 8x8 font is ambiguous between C40 and C64_40X25,
+       and cterm keys its PETSCII colour table and attr defaults off currmode. */
+    if (ios_state.vmode_override >= 0)
+        return ios_state.vmode_override;
+
+    for (size_t i = 0; i < NUMMODES; i++) {
+        if (vparams[i].cols != cols || vparams[i].rows != rows)
+            continue;
+        if (charh > 0 && vparams[i].charheight == charh)
+            return vparams[i].mode;     /* geometry AND cell height agree */
+        if (best == -1)
+            best = vparams[i].mode;     /* geometry alone — remember the first */
+    }
+    return (best == -1) ? C80 : best;
+}
+
+/* Cell height (pixels) for the active mode. Prefers the height of the font actually
+   loaded; falls back to what vparams declares, then to the 8x16 VGA default. */
+static int ios_active_char_height(void) {
+    if (ios_state.char_pixel_height > 0)
+        return ios_state.char_pixel_height;
+
+    int mode = ios_current_vmode();
+    for (size_t i = 0; i < NUMMODES; i++) {
+        if (vparams[i].mode == mode && vparams[i].charheight > 0)
+            return vparams[i].charheight;
+    }
+    return 16;
+}
+
+/*
+ * Adopt the cursor scanlines the ACTIVE VIDEO MODE declares.
+ *
+ * ⚠️ curs_start/curs_end are scanlines WITHIN the character cell, and they are not
+ * portable between cell heights. vparams gives 14..15 for a 16-pixel cell (the VGA
+ * underline) and 7..7 for an 8-pixel one (80x50, 132x60...). This state used to
+ * hard-code the 16-pixel 14/15 for every mode and never revisit it, so on any
+ * 8-pixel cell the cursor was painted at scanlines 14..15 of an 8-high cell: a thin
+ * bar the best part of a ROW BELOW the character it belongs to. Typing landed in the
+ * right place, which is what made it look like a pure rendering bug.
+ *
+ * Key this off vparams, the same table cterm and the sixel geometry read, so the
+ * three can never drift apart. Call it whenever the mode, the geometry or the loaded
+ * font height changes.
+ *
+ * Caller must hold ios_state.mutex.
+ */
+static void ios_apply_mode_cursor_locked(void) {
+    int mode = ios_current_vmode();
+    int s = -1, e = -1;
+
+    for (size_t i = 0; i < NUMMODES; i++) {
+        if (vparams[i].mode == mode) {
+            s = vparams[i].curs_start;
+            e = vparams[i].curs_end;
+            break;
+        }
+    }
+    if (s < 0 || e < 0 || s > e) {
+        /* Unknown mode: bottom two scanlines of whatever cell we have. */
+        int charh = ios_active_char_height();
+        s = charh - 2;
+        e = charh - 1;
+        if (s < 0) s = 0;
+    }
+
+    if (ios_state.default_curs_start == s && ios_state.default_curs_end == e)
+        return;
+
+    ios_state.default_curs_start = s;
+    ios_state.default_curs_end = e;
+
+    /* _NOCURSOR and _SOLIDCURSOR carry scanlines of their own (and setcustomcursor
+       overrides both); only the normal cursor follows the mode default. */
+    if (ios_state.cursor_type == _NORMALCURSOR) {
+        ios_state.curs_start = s;
+        ios_state.curs_end = e;
+    }
+    ios_state.dirty = 1;
+}
+
+/* Public entry point — locks, then applies. */
+void macos_ciolib_apply_mode_cursor(void) {
+    pthread_mutex_lock(&ios_state.mutex);
+    ios_apply_mode_cursor_locked();
     pthread_mutex_unlock(&ios_state.mutex);
 }
 
@@ -884,6 +1325,24 @@ static void ios_setcursortype(int type) {
     ios_state.cursor_type = type;
     ios_state.cursor_visible = (type != _NOCURSOR);
     ios_state.cursor_type_changed = 1;
+
+    /* Match bitmap_setcursortype() scanline logic from bitmap_con.c:1525-1547 */
+    switch (type) {
+        case _NOCURSOR:
+            ios_state.curs_start = 0xFF;
+            ios_state.curs_end = 0;
+            break;
+        case _SOLIDCURSOR:
+            ios_state.curs_start = 0;
+            ios_state.curs_end = ios_active_char_height() - 1;
+            break;
+        default: /* _NORMALCURSOR */
+            ios_state.curs_start = ios_state.default_curs_start;
+            ios_state.curs_end = ios_state.default_curs_end;
+            break;
+    }
+
+    ios_state.dirty = 1;
     pthread_mutex_unlock(&ios_state.mutex);
 }
 
@@ -963,7 +1422,14 @@ static void ios_textmode(int mode) {
     switch (mode) {
         case C40:
         case BW40:
+        /* macOS PETSCII 2026-09-04 */
+        case C64_40X25:
+        case C128_40X25:
             new_width = 40;
+            new_height = 25;
+            break;
+        case C128_80X25:
+            new_width = 80;
             new_height = 25;
             break;
         case C80:
@@ -1028,6 +1494,7 @@ static void ios_textmode(int mode) {
 
     ios_state.cursor_x = 1;
     ios_state.cursor_y = 1;
+    ios_apply_mode_cursor_locked();
     mark_screen_dirty();
 
     pthread_mutex_unlock(&ios_state.mutex);
@@ -1064,13 +1531,22 @@ static int ios_movetext(int sx, int sy, int ex, int ey, int dx, int dy) {
     if (!temp) return 0;
 
     ios_vmem_gettext(sx, sy, ex, ey, temp);
+    g_moving_text = 1;
     ios_vmem_puttext(dx, dy, dx + width - 1, dy + height - 1, temp);
+    g_moving_text = 0;
 
     free(temp);
 
-    // Scroll the sixel pixel buffer when text is scrolled upward.
-    // Only shift pixels for full-width upward moves (the scroll case).
-    if (dy < sy && dx == sx &&
+    // Move the sixel pixel buffer in lock-step with the text.
+    // ⚠️ This used to run only for UPWARD moves (dy < sy), which covered scrolling
+    // and ESC[M delete-line but NOT ESC[L insert-line — cterm implements that as a
+    // DOWNWARD movetext, so the text slid down while the graphics stayed put. Both
+    // directions are handled now; the arithmetic below is already expressed in terms
+    // of sy/dy, so it works either way once the vacated rows are computed on the
+    // correct side of the block.
+    // Still restricted to FULL-WIDTH moves: a partial-width block move would need a
+    // per-row rectangular memmove, and cterm generates none on these paths.
+    if (dy != sy && dx == sx &&
         sx == 1 && ex >= ios_state.width &&
         ios_state.pixel_buffer != NULL && ios_state.pixel_has_data) {
         pthread_mutex_lock(&ios_state.mutex);
@@ -1083,26 +1559,41 @@ static int ios_movetext(int sx, int sy, int ex, int ey, int dx, int dy) {
         int dst_pixel_y = (dy - 1) * ch;   // destination pixel row
         int move_height = (ey - sy + 1) * ch; // pixel rows being moved
 
-        // Clamp to pixel buffer bounds
+        // Clamp to pixel buffer bounds — either end can run past it depending
+        // on which way the block is going.
         if (src_pixel_y + move_height > ph)
             move_height = ph - src_pixel_y;
+        if (dst_pixel_y + move_height > ph)
+            move_height = ph - dst_pixel_y;
 
-        if (move_height > 0 && src_pixel_y < ph && dst_pixel_y < ph) {
-            // Shift pixel rows upward
+        if (move_height > 0 && src_pixel_y >= 0 && dst_pixel_y >= 0 &&
+            src_pixel_y < ph && dst_pixel_y < ph) {
+            // Shift the pixel rows to match the text
             memmove(ios_state.pixel_buffer + dst_pixel_y * pw,
                     ios_state.pixel_buffer + src_pixel_y * pw,
                     (size_t)move_height * (size_t)pw * sizeof(uint32_t));
 
-            // Clear the vacated rows at the bottom
-            int clear_start = dst_pixel_y + move_height;
-            int clear_end = src_pixel_y + move_height;
+            // Clear the part of the SOURCE region the block no longer covers:
+            // the rows below it after moving up, above it after moving down.
+            int clear_start, clear_end;
+            if (dst_pixel_y < src_pixel_y) {          /* moved up */
+                clear_start = dst_pixel_y + move_height;
+                if (clear_start < src_pixel_y)
+                    clear_start = src_pixel_y;
+                clear_end = src_pixel_y + move_height;
+            } else {                                  /* moved down */
+                clear_start = src_pixel_y;
+                clear_end = dst_pixel_y;
+                if (clear_end > src_pixel_y + move_height)
+                    clear_end = src_pixel_y + move_height;
+            }
             if (clear_end > ph) clear_end = ph;
             if (clear_start < clear_end) {
                 memset(ios_state.pixel_buffer + clear_start * pw,
                        0,
                        (size_t)(clear_end - clear_start) * (size_t)pw * sizeof(uint32_t));
             }
-            ios_state.pixel_dirty = 1;
+            mark_all_pixels_dirty();
         }
         pthread_mutex_unlock(&ios_state.mutex);
     }
@@ -1177,7 +1668,7 @@ static void ios_wscroll(void) {
                        (size_t)pw * (size_t)ph * sizeof(uint32_t));
                 ios_state.pixel_has_data = 0;
             }
-            ios_state.pixel_dirty = 1;
+            mark_all_pixels_dirty();
         }
         mark_screen_dirty();
     }
@@ -1334,30 +1825,86 @@ static void ios_setname(const char *name) {
     (void)name;
 }
 
+/* Font slots and video flags, matching Windows wpf_ciolib.c. cterm reads these back:
+ * getfont(1) seeds altfont[] at cterm_init and cterm_write saves/restores slots 1-4
+ * around every call, so getfont must report what setfont stored. */
+static int ios_default_font = 0;
+static int ios_current_font[4] = {0, 0, 0, 0};
+static volatile int ios_video_flags = 0;
+
 static int ios_setfont(int font, int force, int font_num) {
-    (void)font;
     (void)force;
-    (void)font_num;
-    return 0;
+    if (font < 0 || font > 255)
+        return 0;
+
+    /* Reject fonts with no bitmap at any height (cterm then leaves altfont[] alone) */
+    if (conio_fontdata[font].eight_by_sixteen == NULL &&
+        conio_fontdata[font].eight_by_fourteen == NULL &&
+        conio_fontdata[font].eight_by_eight == NULL)
+        return 0;
+
+    /* SyncTERM bitmap_con.c slot logic:
+     *   font_num 0 = default font AND current_font[0] (primary)
+     *   font_num 1 = current_font[0] (primary)
+     *   font_num 2-4 = current_font[1-3] (alt attribute fonts) */
+    switch (font_num) {
+        case 0:
+            ios_default_font = font;
+            ios_current_font[0] = font;
+            break;
+        case 1:
+            ios_current_font[0] = font;
+            break;
+        case 2:
+        case 3:
+        case 4:
+            ios_current_font[font_num - 1] = font;
+            break;
+        default:
+            return 0;
+    }
+
+    if (font_num <= 1)
+        g_current_font_id = font;
+
+    /* Nonzero = success: cterm's CSI n;m SP D records altfont[n] only on a nonzero return */
+    return 1;
 }
 
 static int ios_getfont(int font_num) {
-    (void)font_num;
-    return 0;
+    if (font_num == 0)
+        return ios_default_font;
+    if (font_num >= 1 && font_num <= 4)
+        return ios_current_font[font_num - 1];
+    return -1;
 }
 
 static void ios_setvideoflags(int flags) {
-    (void)flags;
+    pthread_mutex_lock(&ios_state.mutex);
+    if (ios_video_flags != flags) {
+        ios_video_flags = flags;
+        /* iCE / blink mode changes how every existing bit-7 cell is drawn */
+        mark_screen_dirty();
+    }
+    pthread_mutex_unlock(&ios_state.mutex);
 }
 
 static int ios_getvideoflags(void) {
-    return 0;
+    return ios_video_flags;
+}
+
+int macos_ciolib_get_video_flags(void) {
+    return ios_video_flags;
 }
 
 static int ios_setpalette(uint32_t entry, uint16_t r, uint16_t g, uint16_t b) {
-    if (entry >= 16) return 0;
+    if (entry >= 65536) return 0;
     pthread_mutex_lock(&ios_state.mutex);
-    ios_state.palette[entry] = ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    uint32_t rgb = ((r >> 8) << 16) | ((g >> 8) << 8) | (b >> 8);
+    if (ios_state.palette[entry] != rgb) {
+        ios_state.palette[entry] = rgb;
+        mark_screen_dirty();   /* cells drawn in this entry change colour with no cell write (OSC 4 effects) */
+    }
     pthread_mutex_unlock(&ios_state.mutex);
     return 1;
 }
@@ -1437,7 +1984,15 @@ int initciolib(int mode) {
     memset(&cio_api, 0, sizeof(cio_api));
     cio_api.mode = mode;
     cio_api.mouse = 0;
-    cio_api.options = 0;
+    /* Same set as Windows. These feed cterm's CSI < c reply, so each must really work:
+     * BRIGHT_BACKGROUND = video flags stored + packers honour BGBRIGHT, PALETTE_SETTING =
+     * ios_setpalette, LOADABLE_FONTS = ciolib_replace_font (macos_stubs.c) + ios_setfont. */
+    cio_api.options = CONIO_OPT_BRIGHT_BACKGROUND
+                    | CONIO_OPT_PALETTE_SETTING
+                    | CONIO_OPT_LOADABLE_FONTS
+                    | CONIO_OPT_CUSTOM_CURSOR
+                    | CONIO_OPT_SET_PIXEL
+                    | CONIO_OPT_EXTENDED_PALETTE;
     cio_api.clreol = ios_clreol;
     cio_api.puttext = ios_puttext;
     cio_api.vmem_puttext = ios_vmem_puttext;
@@ -1548,6 +2103,7 @@ void macos_ciolib_resize(int width, int height) {
 
     if (ios_state.cursor_x > width) ios_state.cursor_x = width;
     if (ios_state.cursor_y > height) ios_state.cursor_y = height;
+    ios_apply_mode_cursor_locked();
 
     // Free sixel pixel buffer on resize (will be re-allocated on next sixel draw)
     if (ios_state.pixel_buffer) {
@@ -1556,7 +2112,7 @@ void macos_ciolib_resize(int width, int height) {
         ios_state.pixel_width = 0;
         ios_state.pixel_height = 0;
         ios_state.pixel_has_data = 0;
-        ios_state.pixel_dirty = 0;
+        reset_pixels_dirty();
     }
 
     mark_screen_dirty();
@@ -1582,8 +2138,55 @@ void macos_ciolib_cleanup(void) {
         ios_state.pixel_width = 0;
         ios_state.pixel_height = 0;
         ios_state.pixel_has_data = 0;
-        ios_state.pixel_dirty = 0;
+        reset_pixels_dirty();
     }
+
+    // Reset all state fields to defaults so next session starts clean
+    ios_state.width = 80;
+    ios_state.height = 25;
+    ios_state.cursor_x = 1;
+    ios_state.cursor_y = 1;
+    ios_state.cursor_visible = 1;
+    ios_state.cursor_type = _NORMALCURSOR;
+    ios_state.cursor_type_changed = 0;
+    ios_state.current_attr = 7;
+    ios_state.current_flags = 0;
+    ios_state.fg_color = 7;
+    ios_state.bg_color = 0;
+    ios_state.dirty = 0;
+    ios_state.pending_wrap = 0;
+    ios_state.dirty_min_x = 0;
+    ios_state.dirty_max_x = 0;
+    ios_state.dirty_min_y = 0;
+    ios_state.dirty_max_y = 0;
+    ios_state.char_pixel_height = 0;
+    ios_state.curs_start = 14;
+    ios_state.curs_end = 15;
+    ios_state.curs_blinks = 1;
+    ios_state.default_curs_start = 14;
+    ios_state.default_curs_end = 15;
+    ios_state.vmode_override = -1;   // macOS PETSCII 2026-09-04
+
+    // Reset palette: clear all, then restore default CGA 16 colors
+    memset(ios_state.palette, 0, sizeof(ios_state.palette));
+    static const uint32_t default_cga[16] = {
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+        0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+    };
+    memcpy(ios_state.palette, default_cga, sizeof(default_cga));
+
+    // Reset global ciolib colors
+    ciolib_fg = 7;
+    ciolib_bg = 0;
+
+    // Reset font slots and video flags
+    g_current_font_id = 0;
+    ios_default_font = 0;
+    memset(ios_current_font, 0, sizeof(ios_current_font));
+    ios_video_flags = 0;
+
     pthread_mutex_unlock(&ios_state.mutex);
     pthread_mutex_destroy(&ios_state.mutex);
 }
@@ -1684,6 +2287,13 @@ void ciolib_setcursortype(int type) {
 void ciolib_clreol(void) {
     ios_clreol();
 }
+/* Called by cterm's clear2bol() (ESC[1J / ESC[1K) — see ios_clear_pixel_cells. */
+void ciolib_clear_pixel_rect(int sx, int sy, int ex, int ey) {
+    pthread_mutex_lock(&ios_state.mutex);
+    ios_clear_pixel_cells(sx, sy, ex, ey);
+    pthread_mutex_unlock(&ios_state.mutex);
+}
+
 
 void ciolib_delline(void) {
     ios_delline();
@@ -1797,6 +2407,9 @@ void ciolib_setcolour(uint32_t fg, uint32_t bg) {
     pthread_mutex_lock(&ios_state.mutex);
     ios_state.fg_color = fg;
     ios_state.bg_color = bg;
+    // Update global ciolib_fg/bg — used by cursor rendering (color_value(ciolib_fg))
+    ciolib_fg = fg;
+    ciolib_bg = bg;
     pthread_mutex_unlock(&ios_state.mutex);
 }
 
@@ -1828,6 +2441,118 @@ int ciolib_set_modepalette(uint32_t *palette) {
         pthread_mutex_lock(&ios_state.mutex);
         memcpy(ios_state.palette, palette, 16 * sizeof(uint32_t));
         pthread_mutex_unlock(&ios_state.mutex);
+    }
+    return 0;
+}
+
+/* ===========================================================================
+ * macOS PETSCII 2026-09-04 — Commodore video-mode support
+ *
+ * Ported from the iOS build's ios_ciolib.c. These are what let cterm.c's
+ * PETASCII branch key off the right currmode, and what stop the Commodore
+ * modes flickering. See MIGRATION_CTERM.md.
+ * =========================================================================== */
+
+/* Load the 16-entry attribute palette that vparams declares for the active mode.
+   Only non-CGA palettes (C64, Atari, ...) are applied; ordinary text modes keep the
+   CGA colours the renderer has always used, so ANSI sessions are unaffected. */
+void macos_ciolib_apply_mode_palette(void) {
+    static const uint32_t cga_palette[16] = {
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+        0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+    };
+    int pal = -1;
+
+    if (ios_state.vmode_override >= 0) {
+        for (size_t i = 0; i < NUMMODES; i++) {
+            if (vparams[i].mode == ios_state.vmode_override) {
+                pal = vparams[i].palette;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_lock(&ios_state.mutex);
+    /* ⚠️ Uses the palette the SHARED source declares — currently the "pepto" C64 set.
+     *
+     * A local override to the older CTerm-derived set (still in vidmodes.c behind `#if 0`)
+     * was tried on Windows 2026-09-03 and REVERTED the same day: it reads BRIGHTER, not
+     * dimmer, on a real board. Mean luminance says otherwise (126 pepto vs 120 CTerm),
+     * which is exactly why that metric is the wrong one here — the CTerm set is far more
+     * SATURATED (purple B41AE2 vs 8E3C97, cyan 30E6C6 vs 75CEC8, green 1FD21E vs 56AC4D)
+     * and chroma is what reads as glare. Do not "fix the brightness" by swapping palettes
+     * again without looking at a board first. */
+    if (pal == C64_PALETTE || pal == ATARI_PALETTE) {
+        for (int i = 0; i < 16; i++) {
+            uint32_t dac = palettes[pal][i];
+            if (dac < TOTAL_DAC_SIZE) {
+                ios_state.palette[i] = ((uint32_t)dac_default[dac].red << 16)
+                                     | ((uint32_t)dac_default[dac].green << 8)
+                                     |  (uint32_t)dac_default[dac].blue;
+            }
+        }
+    } else {
+        memcpy(ios_state.palette, cga_palette, sizeof(cga_palette));
+    }
+    ios_state.dirty = 1;
+    pthread_mutex_unlock(&ios_state.mutex);
+}
+
+void macos_ciolib_set_video_mode(int mode) {
+    ios_state.vmode_override = mode;
+    /* Picking a mode starts from that mode's video flags, as ciolib's textmode() does, so a
+       board's CSI ?33h (iCE colours) does not carry over into the next connection. The
+       geometry-derived ANSI modes (mode < 0) all start with no flags. */
+    int flags = 0;
+    for (size_t i = 0; mode >= 0 && i < NUMMODES; i++) {
+        if (vparams[i].mode == mode) {
+            flags = vparams[i].flags;
+            break;
+        }
+    }
+    ios_setvideoflags(flags);
+    macos_ciolib_apply_mode_palette();
+    /* C64/C128 declare a full-block 0..7 cursor in vparams; picking the mode has to
+       re-derive the scanlines or the cursor keeps the previous mode's underline. */
+    macos_ciolib_apply_mode_cursor();
+}
+
+int macos_ciolib_get_video_mode(void) {
+    return ios_state.vmode_override;
+}
+
+/**
+ * Does the active video mode treat attribute bit 7 as BACKGROUND BRIGHTNESS rather than BLINK?
+ *
+ * ⚠️ This is what stops the Commodore modes flickering. `set_bright_bg` in cterm.c deliberately
+ * sets attr bit 7 in any CIOLIB_VIDEO_BGBRIGHT mode to mean "background colour 8-15", and the C64
+ * and C128 modes are both BGBRIGHT|NOBLINK. A renderer that still reads bit 7 as the ANSI blink
+ * attribute therefore blinks every reverse-video cell on a PETSCII screen — which on a real board
+ * is most of the artwork.
+ *
+ * ⚠️ Takes NO lock, deliberately. Its caller that matters is the screen-buffer pack loop in
+ * syncterm_macos.c, which is already inside macos_ciolib_lock() — and ios_state.mutex is a plain
+ * (non-recursive) pthread mutex, so re-entering it here would deadlock the render poll.
+ * Everything it reads is a plain int describing the mode, so an unlocked read is safe.
+ */
+int macos_ciolib_mode_no_blink(void) {
+    int mode = ios_current_vmode();
+    for (size_t i = 0; i < NUMMODES; i++) {
+        if (vparams[i].mode == mode)
+            return (vparams[i].flags & CIOLIB_VIDEO_NOBLINK) ? 1 : 0;
+    }
+    return 0;
+}
+
+/* Character cell height (pixels) the active explicit mode expects, or 0 when none. */
+int macos_ciolib_get_mode_char_height(void) {
+    if (ios_state.vmode_override < 0)
+        return 0;
+    for (size_t i = 0; i < NUMMODES; i++) {
+        if (vparams[i].mode == ios_state.vmode_override)
+            return vparams[i].charheight;
     }
     return 0;
 }

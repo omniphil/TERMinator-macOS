@@ -109,3 +109,30 @@ extension Color {
     /// Grid pattern color
     static var gridColor: Color { .termGreen.opacity(0.1) }
 }
+
+/// Home screen card and ticker colors added with the 1.1.0 layout overhaul (Windows RetroTheme).
+extension Color {
+    /// Splash card outline - #FF2BD6
+    static let cardMagenta = Color(red: 1, green: 0.169, blue: 0.839)
+
+    /// Quick Connect card outline - #22E6FF
+    static let cardCyan = Color(red: 0.133, green: 0.902, blue: 1)
+
+    /// Shortcuts card outline and the card drop-shadow glow - #7B5CFF
+    static let cardViolet = Color(red: 0.482, green: 0.361, blue: 1)
+
+    /// History ticker / facts text - #55DD55
+    static let tickerGreen = Color(red: 0.333, green: 0.867, blue: 0.333)
+
+    /// History ticker text while hovered - #9CFF9C
+    static let tickerGreenBright = Color(red: 0.612, green: 1, blue: 0.612)
+}
+
+/// Hacker flair colors added with 1.1.0 (spec §5).
+extension Color {
+    /// Boot screen and connection log background - #050508. Also the command line's ground.
+    static let deepBlack = Color(red: 0.020, green: 0.020, blue: 0.031)
+
+    /// Boot screen "press any key to skip" hint - #555566
+    static let bootHint = Color(red: 0.333, green: 0.333, blue: 0.400)
+}

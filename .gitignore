@@ -52,3 +52,8 @@ Packages/
 
 # Merge conflict backups
 *.orig
+
+# Private / local-only (never publish)
+rollback/
+*.log
+*.bak

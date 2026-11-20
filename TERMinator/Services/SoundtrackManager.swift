@@ -25,7 +25,7 @@ class SoundtrackManager: ObservableObject {
     private static let maxURLLength = 2048
     private static let maxFilenameLength = 128
     private static let maxFileSize: Int64 = 50 * 1024 * 1024  // 50MB per file (video support)
-    private static let defaultCacheLimitMB = 100
+    private static let defaultCacheLimitMB = 250
     private static let masterGain: Float = 0.85
     private static let downloadTimeoutSeconds: TimeInterval = 15
     private static let numChannels = 4
@@ -253,6 +253,8 @@ class SoundtrackManager: ObservableObject {
 
         let targetFile = cacheDir.appendingPathComponent(safeFilename)
         if FileManager.default.fileExists(atPath: targetFile.path) {
+            // Check for newer version in background (conditional GET)
+            checkForNewerVersion(url: url, targetFile: targetFile, safeFilename: safeFilename)
             return
         }
 
@@ -285,6 +287,66 @@ class SoundtrackManager: ObservableObject {
                 }
             } catch {
                 logger.error("Cache move error: \(error.localizedDescription)")
+            }
+        }
+        task.resume()
+    }
+
+    /// Checks if the server has a newer version of a cached file using conditional HTTP GET.
+    /// Uses If-Modified-Since header — server returns 304 if unchanged, 200 if newer.
+    private func checkForNewerVersion(url: URL, targetFile: URL, safeFilename: String) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+
+        // Get the cached file's modification date
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: targetFile.path),
+           let modDate = attrs[.modificationDate] as? Date {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+            formatter.timeZone = TimeZone(identifier: "GMT")
+            request.setValue(formatter.string(from: modDate), forHTTPHeaderField: "If-Modified-Since")
+        }
+
+        let task = downloadSession.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+
+            guard error == nil, let httpResponse = response as? HTTPURLResponse else {
+                if let error = error {
+                    logger.debug("Freshness check error for \(safeFilename): \(error.localizedDescription)")
+                }
+                return
+            }
+
+            if httpResponse.statusCode == 304 {
+                logger.debug("Cache up-to-date: \(safeFilename)")
+                return
+            }
+
+            guard httpResponse.statusCode == 200, let data = data else {
+                logger.debug("Freshness check failed: HTTP \(httpResponse.statusCode) for \(safeFilename)")
+                return
+            }
+
+            guard data.count <= SoundtrackManager.maxFileSize else {
+                logger.debug("Updated file too large: \(data.count) bytes")
+                return
+            }
+
+            // Server has a newer version — write it
+            do {
+                let tempFile = self.cacheDir.appendingPathComponent(safeFilename + ".tmp")
+                try data.write(to: tempFile)
+                try FileManager.default.moveItem(at: tempFile, to: targetFile)
+                logger.info("Updated: \(safeFilename) (\(data.count) bytes)")
+            } catch {
+                do {
+                    try FileManager.default.removeItem(at: targetFile)
+                    try data.write(to: targetFile)
+                    logger.info("Updated (replaced): \(safeFilename) (\(data.count) bytes)")
+                } catch {
+                    logger.debug("Freshness check write error for \(safeFilename): \(error.localizedDescription)")
+                }
             }
         }
         task.resume()
@@ -463,6 +525,7 @@ class SoundtrackManager: ObservableObject {
     }
 
     private func playTracker(ch: AudioChannel, file: URL, loop: Bool) {
+        stopAboutMusic() // one native libxmp player: a BBS tune takes it over from the About box
         let player = ModPlayer()
         guard player.load(file.path) else {
             logger.error("ModPlayer load failed: \(file.lastPathComponent)")
@@ -490,6 +553,60 @@ class SoundtrackManager: ObservableObject {
         player.start()
         ch.modPlayer = player
         logger.info("Ch\(ch.index) playing tracker: \(file.lastPathComponent) (loop=\(loop))")
+    }
+
+    // MARK: - About Box Music
+
+    /// "Elysium" by Jester of Sanity (spec §12.8), a plain bundle resource (not the asset catalog).
+    private static let aboutMusicResource = "ELYSIUM"
+    private static let aboutMusicExtension = "MOD"
+    private static let aboutMusicGain: Float = 0.4 // 60% quieter than a BBS tune at the same setting
+
+    /// The About box's player. Kept off the channels, so it never feeds the audio analyzer.
+    private var aboutPlayer: ModPlayer?
+
+    /// Play the About box's module once through, no looping.
+    /// Skipped while a BBS tracker tune is playing -- libxmp is a single native player, so loading
+    /// this would cut the BBS off.
+    func playAboutMusic() {
+        stopAboutMusic()
+        guard !channels.contains(where: { $0.modPlayer != nil }) else { return }
+
+        guard let url = Bundle.main.url(forResource: SoundtrackManager.aboutMusicResource,
+                                        withExtension: SoundtrackManager.aboutMusicExtension) else {
+            logger.error("About music missing from the app bundle")
+            return
+        }
+        // libxmp loads from a path; the bundle's copy is used directly
+        let player = ModPlayer()
+        guard player.load(url.path) else {
+            logger.error("About music load failed")
+            return
+        }
+
+        // Same volume path as a BBS tune (the settings volume x master gain), then aboutMusicGain
+        let setting = UserDefaults.standard.integer(forKey: SoundtrackManager.keySoundtrackVolume)
+        let volume = Float(max(0, min(10, setting))) / 10.0
+        player.setVolume(toPerceptualVolume(volume) * SoundtrackManager.aboutMusicGain)
+        player.setLooping(false) // libxmp's play-once mode ends it where the last pattern jumps back
+
+        player.completionHandler = { [weak self, weak player] in
+            // Song ended on its own; a manual stop (or a BBS tune taking over) has already cleared the field
+            guard let self = self, let player = player, self.aboutPlayer === player else { return }
+            self.stopAboutMusic()
+        }
+
+        aboutPlayer = player
+        player.start()
+        logger.info("Playing About music")
+    }
+
+    /// Stop the About music at once (the box closed, or a BBS tune needs the player).
+    func stopAboutMusic() {
+        guard let player = aboutPlayer else { return }
+        // Nil first so a completion already queued for this player leaves things alone
+        aboutPlayer = nil
+        player.stop(releaseNative: !channels.contains(where: { $0.modPlayer != nil }))
     }
 
     // MARK: - Stop / Pause / Resume

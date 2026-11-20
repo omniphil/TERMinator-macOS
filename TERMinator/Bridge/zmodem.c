@@ -290,7 +290,7 @@ int zmodem_tx(zmodem_t* zm, unsigned char c)
 			return zmodem_send_esc(zm, c);
 		case CR:
 		case CR | 0x80:
-			if (zm->escape_ctrl_chars && (zm->last_sent & 0x7f) == '@')
+			if (zm->escape_cr || (zm->escape_ctrl_chars && (zm->last_sent & 0x7f) == '@'))
 				return zmodem_send_esc(zm, c);
 			break;
 		case TELNET_IAC:
@@ -922,7 +922,7 @@ int zmodem_recv_data32(zmodem_t* zm, unsigned char * p, unsigned maxlen, unsigne
 						if (!(mask & (1u << k)))
 							continue;
 						unsigned pos = cr_pos[k] + 1;
-						if (pos >= *len || *len + 1 > maxlen)
+						if (pos > *len || *len + 1 > maxlen)  /* pos == *len: CR was the last byte */
 							break;
 						memmove(start_p + pos + 1, start_p + pos, *len - pos);
 						start_p[pos] = 0x00;
@@ -1230,14 +1230,17 @@ BOOL zmodem_recv_hex_header(zmodem_t* zm)
 	}
 
 	/*
-	 * drop the end of line sequence after a hex header
+	 * drop the end of line sequence after a hex header.
+	 * Use zmodem_recv_raw() instead of zmodem_rx() because hex header
+	 * terminators (CR/LF) are sent raw (not ZDLE-escaped), and zmodem_rx()
+	 * would drop them as "unescaped control chars" when escape_ctrl_chars is set.
 	 */
-	c = zmodem_rx(zm);
+	c = zmodem_recv_raw(zm);
 	if (c == '\r' || c == SET_PARITY('\r')) { // CR with Even Parity (Tera Term's ZMODEM sends this)
 		/*
 		 * both bytes are expected when the first received is a CR
 		 */
-		c = zmodem_rx(zm);  /* drop LF */
+		c = zmodem_recv_raw(zm);  /* drop LF */
 	}
 	if (c != '\n' && c != SET_PARITY('\n')) { // LF with Odd Parity
 		lprintf(zm, LOG_ERR, "%s HEX header not terminated with LF: %s"

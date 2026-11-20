@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -195,14 +196,82 @@ static BOOL zmodem_is_connected_cb(void* cbdata) {
 /**
  * ZMODEM Callback: Check if cancelled
  */
+/* Wall-clock deadline for the end-of-session ZFIN exchange; 0 = not armed.
+ * See zmodem_finish_session() for why this has to exist. */
+static int64_t g_zfin_deadline_ms = 0;
+
+static int64_t zmodem_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static BOOL zmodem_is_cancelled_cb(void* cbdata) {
     (void)cbdata;
+
+    /* The ZFIN watchdog rides on the cancel check because that is the ONLY
+     * predicate the engine consults inside its innermost receive loops. */
+    if (g_zfin_deadline_ms != 0 && zmodem_now_ms() > g_zfin_deadline_ms) {
+        return TRUE;
+    }
 
     pthread_mutex_lock(&g_zmodem_transfer.lock);
     int cancelled = g_zmodem_transfer.cancelled;
     pthread_mutex_unlock(&g_zmodem_transfer.lock);
 
     return cancelled ? TRUE : FALSE;
+}
+
+/* How long the whole end-of-session ZFIN exchange gets, start to finish. */
+#define ZFIN_TIMEOUT_MS 8000
+
+/**
+ * Close a ZMODEM session: send ZFIN, wait for the peer's ZFIN, answer with OO.
+ *
+ * ⚠️ NEVER call zmodem_get_zfin() bare -- it can hang forever.
+ *
+ * By the time we get here the FILE IS ALREADY DELIVERED: the receiver commits it
+ * when it answers our ZEOF with ZRINIT, which is what made zmodem_send_file()
+ * return TRUE. Everything below is just the goodbye handshake, and a board that
+ * has already dropped back to its menu will never answer it.
+ *
+ * Left to itself, zmodem_get_zfin() then behaves very badly:
+ *   - it retries max_errors (10) times, ALTERNATING ZFIN and ZABORT, so we spray
+ *     ZABORT at a board that has already banked the file, and the hex headers
+ *     land as junk on its command prompt;
+ *   - each attempt calls zmodem_recv_header(), whose scan loop has NO wall-clock
+ *     bound -- it only gives up after recv_timeout seconds of TOTAL SILENCE. A
+ *     board that is printing its post-upload screen (or echoing the junk we just
+ *     typed at it) keeps that loop fed indefinitely, so the transfer sits at 100%
+ *     and never finishes.
+ *
+ * So: one ZFIN, no ZABORT, and a hard wall-clock deadline enforced through the
+ * cancel callback -- the only predicate the engine consults in its innermost
+ * receive loops. The transfer is still reported COMPLETE either way; whether the
+ * board bothered to say goodbye has no bearing on whether the file arrived.
+ */
+static void zmodem_finish_session(void) {
+    unsigned saved_max_errors   = g_zmodem_transfer.zm.max_errors;
+    unsigned saved_recv_timeout = g_zmodem_transfer.zm.recv_timeout;
+
+    g_zmodem_transfer.zm.max_errors = 1;              /* one ZFIN, never a ZABORT */
+    if (g_zmodem_transfer.zm.recv_timeout > 5)
+        g_zmodem_transfer.zm.recv_timeout = 5;
+    g_zfin_deadline_ms = zmodem_now_ms() + ZFIN_TIMEOUT_MS;
+
+    int type = zmodem_get_zfin(&g_zmodem_transfer.zm);
+
+    g_zfin_deadline_ms = 0;
+    g_zmodem_transfer.zm.max_errors   = saved_max_errors;
+    g_zmodem_transfer.zm.recv_timeout = saved_recv_timeout;
+    /* is_cancelled() ASSIGNS zm->cancelled from the callback, so the watchdog
+     * firing latches it. Clear it -- the session is over and the flag would
+     * otherwise leak into the next transfer's error handling. */
+    g_zmodem_transfer.zm.cancelled = FALSE;
+
+    if (type != ZFIN)
+        zmodem_lputs_cb(NULL, LOG_WARNING,
+                        "No ZFIN from the receiver; the file was already delivered, closing anyway");
 }
 
 /**
@@ -502,7 +571,7 @@ int zmodem_ios_send(const char* file_path) {
     pthread_mutex_unlock(&g_zmodem_transfer.lock);
 
     // Properly end the ZMODEM session
-    zmodem_get_zfin(&g_zmodem_transfer.zm);
+    zmodem_finish_session();
 
     return success ? 0 : -6;
 }

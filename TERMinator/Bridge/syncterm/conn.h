@@ -45,6 +45,10 @@ enum {
 	CONN_TYPE_TELNETS
 	,
 	CONN_TYPE_TERMINATOR
+	,
+	CONN_TYPE_WEBSOCKET      /* ws://  (RFC 6455, telnet payload) */
+	,
+	CONN_TYPE_WEBSOCKETS     /* wss:// (RFC 6455 over TLS)        */
 };
 
 #define IS_NETWORK_CONN(x) (                \
@@ -55,7 +59,9 @@ enum {
 	((x) == CONN_TYPE_SSH) ||                \
 	((x) == CONN_TYPE_SSHNA) ||               \
 	((x) == CONN_TYPE_MBBS_GHOST) ||           \
-	((x) == CONN_TYPE_TELNETS))
+	((x) == CONN_TYPE_TELNETS) ||               \
+	((x) == CONN_TYPE_WEBSOCKET) ||              \
+	((x) == CONN_TYPE_WEBSOCKETS))
 
 struct conn_api {
 	int               (*connect)(struct bbslist *bbs);

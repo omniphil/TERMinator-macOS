@@ -1,13 +1,34 @@
 import SwiftUI
+import AppKit
 
-/// A scrolling marquee view with authentic CRT effects matching the Android/iOS version.
-/// Features per-character brightness variation, phosphor glow, scanlines,
-/// micro-jitter, major glitch events, random case flips, and noise artifacts.
+/// The home screen's scrolling marquee, drawn the way Windows `HomeView.xaml` draws it: plain
+/// #66EE66 text in Consolas 12 (Menlo 12 where Consolas isn't installed — macOS doesn't ship it),
+/// no glow, on a transparent strip 26 high (4 padding + an 18-high canvas, text 1 down) that spans
+/// the full 600-wide panel. One pass runs from the right edge to fully off the left in
+/// textWidth / 45 seconds (`HomeView.SetupAnimation`), then repeats.
+///
+/// Glitches as `HomeView.StartMarqueeGlitch`: ±2 px horizontal micro-jitter every 80 ms, 1-2 random
+/// letter case flips every 100 ms that each hold ~350 ms, and every 1.5-4 s a 30-80 ms flicker
+/// (x ±2, y ±1, opacity 0.70-0.85).
 struct CrtMarqueeView: View {
     let text: String
-    var textColor: Color = Color(red: 0.4, green: 0.93, blue: 0.4) // #66EE66 - phosphor green
-    var backgroundColor: Color = .background
-    var scrollSpeed: Double = 50 // pixels per second
+    var textColor: Color = Color(red: 0x66 / 255.0, green: 0xEE / 255.0, blue: 0x66 / 255.0) // #66EE66
+    /// Windows `HomeView.SetupAnimation`: one pass (container width to -textWidth) takes
+    /// textWidth / 45 seconds, so the speed scales with the text rather than being fixed.
+    var passSecondsPerPoint: Double = 1.0 / 45.0
+
+    /// Windows: Border Padding="0,4" around an 18-high Canvas, TextBlock at Canvas.Top 1.
+    static let stripHeight: CGFloat = 26
+    private static let textTop: CGFloat = 5
+    private static let fontSize: CGFloat = 12
+
+    /// Consolas when present (Office for Mac installs it), else Menlo — both monospaced at 12 pt.
+    private static let fontName: String =
+        NSFont(name: "Consolas", size: CrtMarqueeView.fontSize) != nil ? "Consolas" : "Menlo"
+    private static var nsFont: NSFont {
+        NSFont(name: CrtMarqueeView.fontName, size: CrtMarqueeView.fontSize)
+            ?? NSFont.monospacedSystemFont(ofSize: CrtMarqueeView.fontSize, weight: .regular)
+    }
 
     @State private var offset: CGFloat = 0
     @State private var textWidth: CGFloat = 0
@@ -17,7 +38,6 @@ struct CrtMarqueeView: View {
     @State private var microJitterX: CGFloat = 0
 
     // Major glitch state
-    @State private var isGlitching: Bool = false
     @State private var glitchVerticalOffset: CGFloat = 0
     @State private var glitchHorizontalOffset: CGFloat = 0
     @State private var glitchAlpha: Double = 1.0
@@ -29,100 +49,57 @@ struct CrtMarqueeView: View {
     // Timers
     @State private var scrollTimer: Timer?
     @State private var microJitterTimer: Timer?
-    @State private var brightnessTimer: Timer?
+    @State private var caseFlipTimer: Timer?
     @State private var glitchScheduleTimer: Timer?
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack {
-                backgroundColor
-
-                ZStack {
-                    // Glow layer
-                    marqueeText
-                        .foregroundColor(textColor.opacity(0.15))
-                        .blur(radius: 4)
-                        .offset(
-                            x: offset + microJitterX + glitchHorizontalOffset,
-                            y: glitchVerticalOffset
-                        )
-
-                    // Main text
-                    marqueeText
-                        .foregroundColor(textColor.opacity(0.78 * glitchAlpha))
-                        .offset(
-                            x: offset + microJitterX + glitchHorizontalOffset,
-                            y: glitchVerticalOffset
-                        )
-                }
-                .frame(width: max(geometry.size.width - 280, 100))
+            Text(displayText)
+                .font(.custom(Self.fontName, size: Self.fontSize))
+                .foregroundColor(textColor)
+                .opacity(glitchAlpha)
+                .lineLimit(1)
+                .fixedSize()
+                .offset(x: offset + microJitterX + glitchHorizontalOffset,
+                        y: Self.textTop + glitchVerticalOffset)
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
                 .clipped()
-            }
-            .onAppear {
-                containerWidth = geometry.size.width
-                displayText = text
-                startEffects()
-            }
-            .onDisappear {
-                stopEffects()
-            }
-            .onChange(of: geometry.size.width) { newWidth in
-                containerWidth = newWidth
-            }
+                .onAppear {
+                    containerWidth = geometry.size.width
+                    displayText = text
+                    // Measured once from the unflipped text: case flips don't change a monospaced width.
+                    textWidth = ceil((text as NSString).size(withAttributes: [.font: Self.nsFont]).width)
+                    startEffects()
+                }
+                .onDisappear {
+                    stopEffects()
+                }
+                .onChange(of: geometry.size.width) { newWidth in
+                    containerWidth = newWidth
+                }
         }
-        .frame(height: 36)
-    }
-
-    private var retroFont: Font {
-        .custom("Menlo-Bold", size: 14)
-    }
-
-    private var marqueeText: some View {
-        HStack(spacing: 0) {
-            Text(displayText)
-                .font(retroFont)
-                .tracking(1)
-                .fixedSize()
-                .background(
-                    GeometryReader { textGeometry in
-                        Color.clear
-                            .onAppear {
-                                textWidth = textGeometry.size.width
-                            }
-                            .onChange(of: textGeometry.size.width) { newWidth in
-                                if newWidth > textWidth {
-                                    textWidth = newWidth
-                                }
-                            }
-                    }
-                )
-
-            Spacer().frame(width: max(containerWidth, 100))
-
-            Text(displayText)
-                .font(retroFont)
-                .tracking(1)
-                .fixedSize()
-        }
+        .frame(height: Self.stripHeight)
+        .allowsHitTesting(false)
     }
 
     // MARK: - Effect Management
 
     private func startEffects() {
+        stopEffects()
         startScrolling()
         startMicroJitter()
-        startBrightnessVariation()
+        startCaseFlips()
         scheduleNextGlitch()
     }
 
     private func stopEffects() {
         scrollTimer?.invalidate()
         microJitterTimer?.invalidate()
-        brightnessTimer?.invalidate()
+        caseFlipTimer?.invalidate()
         glitchScheduleTimer?.invalidate()
         scrollTimer = nil
         microJitterTimer = nil
-        brightnessTimer = nil
+        caseFlipTimer = nil
         glitchScheduleTimer = nil
     }
 
@@ -134,7 +111,9 @@ struct CrtMarqueeView: View {
         scrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { _ in
             guard textWidth > 0 else { return }
 
-            let delta = CGFloat(scrollSpeed / 60.0)
+            // Distance of one pass over its duration (textWidth / 45 s), per 60 Hz tick.
+            let passSeconds = max(Double(textWidth) * passSecondsPerPoint, 0.1)
+            let delta = CGFloat(Double(containerWidth + textWidth) / passSeconds / 60.0)
             offset -= delta
 
             if offset <= -textWidth {
@@ -153,8 +132,8 @@ struct CrtMarqueeView: View {
 
     // MARK: - Case Flips
 
-    private func startBrightnessVariation() {
-        brightnessTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { _ in
+    private func startCaseFlips() {
+        caseFlipTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { _ in
             updateDisplayText()
         }
     }
@@ -165,10 +144,14 @@ struct CrtMarqueeView: View {
 
         caseFlips = caseFlips.filter { $0.value > now }
 
+        // Windows: 1-2 new flips per tick, letters only, each held ~350 ms.
+        guard !chars.isEmpty else { return }
         let flipCount = Int.random(in: 1...2)
         for _ in 0..<flipCount {
             let index = Int.random(in: 0..<chars.count)
-            caseFlips[index] = now.addingTimeInterval(0.25)
+            if chars[index].isLetter {
+                caseFlips[index] = now.addingTimeInterval(0.35)
+            }
         }
 
         for (index, _) in caseFlips {
@@ -194,24 +177,20 @@ struct CrtMarqueeView: View {
     }
 
     private func triggerMajorGlitch() {
-        isGlitching = true
+        // Windows sets the values outright (no easing) and clears them after 30-80 ms.
+        glitchVerticalOffset = CGFloat.random(in: -1...1)
+        glitchHorizontalOffset = CGFloat.random(in: -2...2)
+        glitchAlpha = Double.random(in: 0.7...0.85)
 
         let glitchDuration = Double.random(in: 0.03...0.08)
-
-        withAnimation(.linear(duration: 0.02)) {
-            glitchVerticalOffset = CGFloat.random(in: -1...1)
-            glitchHorizontalOffset = CGFloat.random(in: -2...2)
-            glitchAlpha = Double.random(in: 0.7...0.85)
-        }
-
         DispatchQueue.main.asyncAfter(deadline: .now() + glitchDuration) {
-            withAnimation(.linear(duration: 0.02)) {
-                glitchVerticalOffset = 0
-                glitchHorizontalOffset = 0
-                glitchAlpha = 1.0
+            glitchVerticalOffset = 0
+            glitchHorizontalOffset = 0
+            glitchAlpha = 1.0
+            // Only reschedule while the marquee is still on screen (stopEffects clears the timer).
+            if glitchScheduleTimer != nil {
+                scheduleNextGlitch()
             }
-            isGlitching = false
-            scheduleNextGlitch()
         }
     }
 }

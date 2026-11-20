@@ -246,6 +246,27 @@ struct cterminal {
 	char prestel_data[PRESTEL_MEM_SLOTS][PRESTEL_MEM_SLOT_SIZE];
 	enum prestel_prog_states prestel_prog_state;
 	uint8_t prestel_mem;
+
+	/* Physical key reports (CSI = 1 h/l) and translated-key suppression (CSI = 2 h/l), from upstream
+	 * SyncTERM.  Only the mode state lives here: the front end captures the physical keys and sends the
+	 * CSI = Pk K / k reports.  A front end that can do that sets key_event_mode_change, which is also what
+	 * makes the CSI < c reply advertise capability 8 -- leave it NULL and nothing changes. */
+	bool pk_mode;
+	bool suppress_translated_keys;
+	void (*key_event_mode_change)(int enable, void *cbdata);
+	void *key_event_mode_change_cbdata;
+
+	/* TERMinator (osc_ext.c, PORT_TO_MAC_LINUX.md 12.62): OSC strings cterm doesn't handle itself (0/2 window
+	 * title, 8 hyperlink, 52 clipboard) go to osc_handler.  While link_track is set, cell_hook hears every
+	 * printable character cterm places (screen coordinates, 1-based) and region_hook every clear/scroll, so the
+	 * link map follows the text.  All NULL/false = upstream behaviour. */
+	void (*osc_handler)(struct cterminal *cterm, const char *strbuf, size_t len);
+	void (*cell_hook)(struct cterminal *cterm, int sx, int sy, unsigned char ch);
+	void (*region_hook)(struct cterminal *cterm, int op, int sx, int sy, int ex, int ey);
+#define CTERM_REGION_CLEAR	0
+#define CTERM_REGION_UP		1	/* rows sy+1..ey move up one, ey is vacated */
+#define CTERM_REGION_DOWN	2	/* rows sy..ey-1 move down one, sy is vacated */
+	bool link_track;
 };
 
 #ifdef __cplusplus

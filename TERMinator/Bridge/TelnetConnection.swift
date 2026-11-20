@@ -136,8 +136,8 @@ private enum TelnetCommand: UInt8 {
 
             connection?.start(queue: queue)
 
-            // Timeout after 5 seconds
-            DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            // Timeout after 10 seconds
+            DispatchQueue.global().asyncAfter(deadline: .now() + 10.0) { [weak self] in
                 guard !hasResumed else { return }
                 print("Connection timeout")
                 self?.disconnect()
@@ -193,8 +193,8 @@ private enum TelnetCommand: UInt8 {
 
         connection?.start(queue: queue)
 
-        // Wait for connection with 5 second timeout
-        let result = semaphore.wait(timeout: .now() + 5.0)
+        // Wait for connection with 10 second timeout
+        let result = semaphore.wait(timeout: .now() + 10.0)
         if result == .timedOut {
             print("Connection timeout")
             disconnect()
@@ -761,7 +761,10 @@ class TelnetSProxy {
         tcpOptions.keepaliveIdle = 10
         tcpOptions.keepaliveInterval = 5
         tcpOptions.keepaliveCount = 3
-        tcpOptions.connectionTimeout = 15
+        // The Preferences connection timeout (PORT_TO_MAC_LINUX §12.27), read per connect. TCP keeps its old 5 s of
+        // headroom over the TLS wait below (it was 15 over 10), and the TLS wait equals NativeBridge.connectAsync's.
+        let timeoutSeconds = AppPreferences.connectionTimeout
+        tcpOptions.connectionTimeout = timeoutSeconds + 5
 
         let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
 
@@ -796,7 +799,7 @@ class TelnetSProxy {
 
         connection?.start(queue: queue)
 
-        let result = semaphore.wait(timeout: .now() + 15.0)
+        let result = semaphore.wait(timeout: .now() + .seconds(timeoutSeconds))
         if result == .timedOut || !connected {
             print("[TelnetS] Connection timeout or failed")
             disconnect()

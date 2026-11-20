@@ -49,6 +49,9 @@
  #include "conn_conpty.h"
 #endif
 #include "conn_telnet.h"
+#ifdef WITH_WEBSOCKET
+ #include "conn_websocket.h"
+#endif
 
 #ifdef _MSC_VER
 #pragma warning(disable : 4244 4267 4018)
@@ -57,13 +60,13 @@
 struct conn_api    conn_api;
 char              *conn_types_enum[] = {
 	"Unknown", "RLogin", "RLoginReversed", "Telnet", "Raw", "SSH", "SSHNA", "Modem", "Serial", "NoRTS", "Shell",
-	"MBBSGhost", "TelnetS", NULL
+	"MBBSGhost", "TelnetS", "TERMinator", "WebSocket", "WebSocketS", NULL
 };
 char              *conn_types[] = {
 	"Unknown", "RLogin", "RLogin Reversed", "Telnet", "Raw", "SSH", "SSH (no auth)", "Modem", "Serial",
-	"3-wire (No RTS)", "Shell", "MBBS GHost", "TelnetS", NULL
+	"3-wire (No RTS)", "Shell", "MBBS GHost", "TelnetS", "TERMinator", "WebSocket", "Secure WebSocket", NULL
 };
-short unsigned int conn_ports[] = {0, 513, 513, 23, 0, 22, 22, 0, 0, 0, 0, 65535, 992, 0};
+short unsigned int conn_ports[] = {0, 513, 513, 23, 0, 22, 22, 0, 0, 0, 0, 65535, 992, 0, 80, 443};
 
 struct conn_buffer conn_inbuf;
 struct conn_buffer conn_outbuf;
@@ -417,6 +420,15 @@ conn_connect(struct bbslist *bbs)
 			conn_api.close = ssh_close;
 			break;
 #endif
+#ifdef WITH_WEBSOCKET
+		case CONN_TYPE_WEBSOCKET:
+		case CONN_TYPE_WEBSOCKETS:
+			conn_api.connect = websocket_connect;
+			conn_api.close = websocket_close;
+			conn_api.binary_mode_on = telnet_binary_mode_on;
+			conn_api.binary_mode_off = telnet_binary_mode_off;
+			break;
+#endif
 #ifndef __HAIKU__
 		case CONN_TYPE_SERIAL:
 		case CONN_TYPE_SERIAL_NORTS:
@@ -603,6 +615,14 @@ conn_socket_connect(struct bbslist *bbs, bool can_cancel)
 #endif
 					printf("[conn_socket_connect] Waiting for connection (EINPROGRESS/etc)...\n");
 					for (; sock != INVALID_SOCKET;) {
+						/* Check if connection was aborted externally
+						   (e.g. syncterm_disconnect from another thread) */
+						if (conn_api.terminate) {
+							failcode = FAILURE_ABORTED;
+							closesocket(sock);
+							sock = INVALID_SOCKET;
+							break;
+						}
 						if (socket_writable(sock, 1000)) {
 							tries++;
 							printf("[conn_socket_connect] socket writable, tries=%d, can_cancel=%d\n", tries, can_cancel);
