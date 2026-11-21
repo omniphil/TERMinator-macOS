@@ -17,6 +17,9 @@ enum AppInfo {
     /// lines back into step (first listed as 1.0.6) is now 1.1.0, shared by all three
     /// desktop clients. Do not "fill the gap" later.
     static let changelog: [(version: String, changes: [String])] = [
+        ("1.1.7", ["TAP+ improvements",
+                   "Connection time out retries",
+                   "SSH lockup fix"]),
         // Same line as Windows 1.1.6 (PORT_TO_MAC_LINUX.md "2026-10-20 — 1.1.6"): a Rainwire board's menus drawn here.
         ("1.1.6", ["Rainwire screen engine support",
                    "Rainwire gadget engine support",

@@ -523,9 +523,15 @@ enum failure_reason {
 	FAILURE_DISCONNECTED
 };
 
+/* A connect that gets no SYN-ACK is dropped after CONN_CONNECT_WAIT_SECS and retried on a fresh socket
+   (new source port), up to CONN_CONNECT_ATTEMPTS times. Some home-hosted BBSes drop a few SYNs. */
+#define CONN_CONNECT_ATTEMPTS 3
+#define CONN_CONNECT_WAIT_SECS 8
+
 SOCKET
 conn_socket_connect(struct bbslist *bbs, bool can_cancel)
 {
+	int              attempt;
 	SOCKET           sock = INVALID_SOCKET;
 #ifdef _WIN32
 	u_long           nonblock;
@@ -584,6 +590,15 @@ conn_socket_connect(struct bbslist *bbs, bool can_cancel)
 	}
 
 	printf("[conn_socket_connect] Entering connection loop\n");
+	for (attempt = 0; attempt < CONN_CONNECT_ATTEMPTS && res && sock == INVALID_SOCKET && failcode == FAILURE_WHAT_FAILURE; attempt++) {
+	bool timed_out = false;
+	if (attempt > 0) {
+		fprintf(stderr, "[conn_socket_connect] no answer from %s:%hu, retry %d/%d\n", bbs->addr, bbs->port, attempt, CONN_CONNECT_ATTEMPTS - 1);
+		if (!bbs->hidepopups) {
+			uifc.pop(NULL);
+			uifc.pop("No answer, retrying...");
+		}
+	}
 	for (cur = res; cur && sock == INVALID_SOCKET && failcode == FAILURE_WHAT_FAILURE; cur = cur->ai_next) {
 		printf("[conn_socket_connect] Trying address family=%d, socktype=%d, protocol=%d\n",
 		       cur->ai_family, cur->ai_socktype, cur->ai_protocol);
@@ -604,6 +619,7 @@ conn_socket_connect(struct bbslist *bbs, bool can_cancel)
 		printf("[conn_socket_connect] Calling connect()\n");
 		if (connect(sock, cur->ai_addr, cur->ai_addrlen)) {
 			int tries = 0;
+			int waited = 0;
 			int err = ERROR_VALUE;
 			printf("[conn_socket_connect] connect() returned non-zero, ERROR_VALUE=%d\n", err);
 			switch (err) {
@@ -644,6 +660,12 @@ conn_socket_connect(struct bbslist *bbs, bool can_cancel)
 							}
 						}
 						else {
+							if (++waited >= CONN_CONNECT_WAIT_SECS) {
+								timed_out = true;
+								closesocket(sock);
+								sock = INVALID_SOCKET;
+								break;
+							}
 							if (can_cancel) {
 								if (kbhit()) {
 									printf("[conn_socket_connect] User cancelled via kbhit\n");
@@ -664,6 +686,9 @@ connected:
 					continue;
 			}
 		}
+	}
+	if (!timed_out)
+		break;
 	}
 	if (sock != INVALID_SOCKET) {
 		freeaddrinfo(res);

@@ -26,6 +26,11 @@
 #pragma warning(disable : 4244 4267 4018)
 #endif
 
+/* A PopData error other than a timeout that repeats this many times in a row with nothing read ends the session.
+   Before this the input loop retried it forever at 100% CPU and never read the socket again: the screen froze
+   (Android, shsbbs.net EleBBS message newscan, 2026-11-21). */
+#define SSH_POP_ERROR_LIMIT 200
+
 SOCKET          ssh_sock = INVALID_SOCKET;
 CRYPT_SESSION   ssh_session = -1;
 int             ssh_channel = -1;
@@ -226,6 +231,9 @@ ssh_input_thread(void *args)
 	bool   sftp_do_finish;
 	bool   data_avail;
 
+	int    pop_errors = 0;
+	int    last_pop_error = 0;
+
 	SetThreadName("SSH Input");
 	conn_api.input_thread_running = 1;
 	while (!conn_api.terminate) {
@@ -287,8 +295,27 @@ ssh_input_thread(void *args)
 		}
 
 		cryptSetAttribute(ssh_session, CRYPT_OPTION_NET_READTIMEOUT, 0);
+		rd = 0;
 		popstatus = PopData(ssh_session, conn_api.rd_buf, conn_api.rd_buf_size, &rd);
 		cryptSetAttribute(ssh_session, CRYPT_OPTION_NET_READTIMEOUT, 30);
+		if (cryptStatusError(popstatus) && popstatus != CRYPT_ERROR_TIMEOUT) {
+			if (popstatus != last_pop_error || pop_errors == 0)
+				fprintf(stderr, "[ssh input] PopData error %d (rd=%d)\n", popstatus, rd);
+			if (popstatus == last_pop_error && rd <= 0)
+				pop_errors++;
+			else
+				pop_errors = 1;
+			last_pop_error = popstatus;
+			if (pop_errors >= SSH_POP_ERROR_LIMIT) {
+				fprintf(stderr, "[ssh input] PopData error %d repeated %d times, closing session\n", popstatus, pop_errors);
+				assert_pthread_mutex_unlock(&ssh_mutex);
+				break;
+			}
+		}
+		else if (cryptStatusOK(popstatus)) {
+			pop_errors = 0;
+			last_pop_error = 0;
+		}
 		if (cryptStatusOK(popstatus)) {
 			if (g_has_channel_api) {
 				gchstatus = cryptGetAttribute(ssh_session, CRYPT_SESSINFO_SSH_CHANNEL, &chan);

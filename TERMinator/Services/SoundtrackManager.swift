@@ -27,7 +27,25 @@ class SoundtrackManager: ObservableObject {
     private static let maxFileSize: Int64 = 50 * 1024 * 1024  // 50MB per file (video support)
     private static let defaultCacheLimitMB = 250
     private static let masterGain: Float = 0.85
+    /// Stall timeout: URLSession's timeoutIntervalForRequest is an idle timeout (no data for this long).
     private static let downloadTimeoutSeconds: TimeInterval = 15
+    /// Total cap for one download once it has started. Generous, since queueing is now ours (see cacheFile).
+    private static let downloadResourceTimeoutSeconds: TimeInterval = 300
+    private static let maxConcurrentDownloads = 4
+    private static let pendingPlayWaitMs = 60_000  // a play waits this long for a file that is queued or downloading
+    private static let unknownPlayWaitMs = 10_000  // ...and this long for one no download is known for
+    /// A missing file whose download fails (stall, dropped connection, 5xx) is tried again after these delays.
+    private static let retryDelaysSec = [30, 60, 120]
+
+    /// RFC 1123 HTTP date (If-Modified-Since / Last-Modified). DateFormatter is thread-safe for use.
+    private static let httpDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        return formatter
+    }()
+
     private static let numChannels = 4
 
     private static let videoExtensions: Set<String> = ["mp4", "m4v", "webm"]
@@ -72,6 +90,9 @@ class SoundtrackManager: ObservableObject {
         // Completion handlers capture the generation at schedule time and
         // ignore the callback if it no longer matches (stale).
         var generation: Int = 0
+        // Bumped by every play/stop (main thread only), so a play still waiting on a download
+        // knows it has been superseded.
+        var playGeneration: Int = 0
 
         // Queue for auto-advance playback
         var queue: [(filename: String, delaySec: Int)] = []
@@ -114,6 +135,15 @@ class SoundtrackManager: ObservableObject {
     // Maps TAP display names to actual cached filenames (e.g. "Axel F" -> "AxelF.mod")
     private var displayNameMap: [String: String] = [:]
 
+    // Download queue (cacheFile / pumpDownloads). Everything below is only touched on downloadStateQueue.
+    private let downloadStateQueue = DispatchQueue(label: "SoundtrackManager.downloads")
+    private var missingQueue: [DownloadJob] = []    // not cached yet: first
+    private var freshnessQueue: [DownloadJob] = []  // cached: check for a newer copy
+    private var queuedDownloads: Set<String> = []   // queued, waiting for a retry, or running
+    private var urlByFilename: [String: URL] = [:]
+    private var activeDownloads = 0
+    private var retryWaiting: [String: DownloadJob] = [:]  // failed, retry timer running
+
     // MARK: - Init
 
     private init() {
@@ -123,7 +153,7 @@ class SoundtrackManager: ObservableObject {
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = SoundtrackManager.downloadTimeoutSeconds
-        config.timeoutIntervalForResource = SoundtrackManager.downloadTimeoutSeconds * 2
+        config.timeoutIntervalForResource = SoundtrackManager.downloadResourceTimeoutSeconds
         downloadSession = URLSession(configuration: config)
 
         for i in 0..<SoundtrackManager.numChannels {
@@ -233,6 +263,37 @@ class SoundtrackManager: ObservableObject {
 
     // MARK: - Download & Cache
 
+    /// One file to fetch for the cache. A class so the retry bookkeeping (attempt) is shared
+    /// between the queue and the retry-waiting table. Only touched on downloadStateQueue.
+    private final class DownloadJob {
+        let url: URL
+        let safeFilename: String
+        let targetFile: URL
+        /// Already cached: only replace it if the server's copy is newer (If-Modified-Since).
+        let freshnessOnly: Bool
+        /// Retries used so far (see retryDelaysSec).
+        var attempt = 0
+
+        init(url: URL, safeFilename: String, targetFile: URL, freshnessOnly: Bool) {
+            self.url = url
+            self.safeFilename = safeFilename
+            self.targetFile = targetFile
+            self.freshnessOnly = freshnessOnly
+        }
+    }
+
+    private enum DownloadResult {
+        case done
+        case retryableFailure
+        case permanentFailure
+    }
+
+    /// Queue a file from a URL for the cache.
+    /// The display name from TAP is used as a key; the actual filename from the URL is used for storage.
+    /// Downloads go through a small queue (maxConcurrentDownloads at a time): a door can send a hundred
+    /// cache commands in one burst (Skyraiders sends ~127), and starting them all at once made most of
+    /// them time out, because URLSession's resource timeout also counts the time a task spends waiting
+    /// for a connection to the host.
     private func cacheFile(url urlString: String, displayName: String) {
         guard isValidUrl(urlString) else {
             logger.warning("Invalid URL rejected: \(urlString)")
@@ -252,104 +313,206 @@ class SoundtrackManager: ObservableObject {
         }
 
         let targetFile = cacheDir.appendingPathComponent(safeFilename)
-        if FileManager.default.fileExists(atPath: targetFile.path) {
-            // Check for newer version in background (conditional GET)
-            checkForNewerVersion(url: url, targetFile: targetFile, safeFilename: safeFilename)
-            return
+        let cached = FileManager.default.fileExists(atPath: targetFile.path)
+        downloadStateQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.urlByFilename[safeFilename] = url  // lets play() retry a download that failed
+            guard !self.queuedDownloads.contains(safeFilename) else { return }  // already queued or downloading
+            self.queuedDownloads.insert(safeFilename)
+            let job = DownloadJob(url: url, safeFilename: safeFilename, targetFile: targetFile, freshnessOnly: cached)
+            // Missing files go before freshness checks of files we already have
+            if cached {
+                self.freshnessQueue.append(job)
+            } else {
+                self.missingQueue.append(job)
+            }
+            self.pumpDownloads()
+        }
+    }
+
+    /// Starts queued downloads while there are free slots; missing files first.
+    /// Must be called on downloadStateQueue.
+    private func pumpDownloads() {
+        dispatchPrecondition(condition: .onQueue(downloadStateQueue))
+        while activeDownloads < SoundtrackManager.maxConcurrentDownloads {
+            let job: DownloadJob
+            if !missingQueue.isEmpty {
+                job = missingQueue.removeFirst()
+            } else if !freshnessQueue.isEmpty {
+                job = freshnessQueue.removeFirst()
+            } else {
+                break
+            }
+            activeDownloads += 1
+            startDownload(job)
+        }
+    }
+
+    /// Creates and resumes the URLSession task for a job that has a slot. The task is only created
+    /// here, so its resource timeout never covers time spent waiting in our queue.
+    private func startDownload(_ job: DownloadJob) {
+        var request = URLRequest(url: job.url)
+        request.httpMethod = "GET"
+        if job.freshnessOnly,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: job.targetFile.path),
+           let modDate = attrs[.modificationDate] as? Date {
+            request.setValue(SoundtrackManager.httpDateFormatter.string(from: modDate),
+                             forHTTPHeaderField: "If-Modified-Since")
         }
 
-        let task = downloadSession.downloadTask(with: url) { [weak self] tempURL, response, error in
-            guard let self = self, let tempURL = tempURL, error == nil else {
-                if let error = error {
-                    logger.error("Download error: \(error.localizedDescription)")
-                }
-                return
-            }
-
-            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
-                logger.warning("Download failed: HTTP \(httpResponse.statusCode)")
-                return
-            }
-
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: tempURL.path),
-               let fileSize = attrs[.size] as? Int64,
-               fileSize > SoundtrackManager.maxFileSize {
-                logger.warning("File too large: \(fileSize) bytes")
-                return
-            }
-
-            do {
-                try FileManager.default.moveItem(at: tempURL, to: targetFile)
-                logger.info("Cached: \(safeFilename)")
-                self.pruneCache()
-                DispatchQueue.main.async {
-                    self.updateCacheSize()
-                }
-            } catch {
-                logger.error("Cache move error: \(error.localizedDescription)")
+        logger.info("\(job.freshnessOnly ? "Checking for newer" : "Downloading"): \(job.url.absoluteString)")
+        let task = downloadSession.downloadTask(with: request) { [weak self] tempURL, response, error in
+            guard let self = self else { return }
+            // The temp file is only valid until this handler returns, so it is handled right here
+            let result = self.finishDownload(job: job, tempURL: tempURL, response: response, error: error)
+            self.downloadStateQueue.async {
+                self.downloadFinished(job: job, result: result)
             }
         }
         task.resume()
     }
 
-    /// Checks if the server has a newer version of a cached file using conditional HTTP GET.
-    /// Uses If-Modified-Since header — server returns 304 if unchanged, 200 if newer.
-    private func checkForNewerVersion(url: URL, targetFile: URL, safeFilename: String) {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-
-        // Get the cached file's modification date
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: targetFile.path),
-           let modDate = attrs[.modificationDate] as? Date {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
-            formatter.timeZone = TimeZone(identifier: "GMT")
-            request.setValue(formatter.string(from: modDate), forHTTPHeaderField: "If-Modified-Since")
+    /// Checks the response of one download and moves the file into the cache.
+    /// Runs on URLSession's delegate queue (not downloadStateQueue): touches no queue state.
+    private func finishDownload(job: DownloadJob, tempURL: URL?, response: URLResponse?, error: Error?) -> DownloadResult {
+        if let error = error {
+            // Includes timeoutIntervalForRequest firing, i.e. no data for downloadTimeoutSeconds
+            logger.error("Download error for \(job.safeFilename): \(error.localizedDescription)")
+            return .retryableFailure
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            logger.error("Download error for \(job.safeFilename): no HTTP response")
+            return .retryableFailure
         }
 
-        let task = downloadSession.dataTask(with: request) { [weak self] data, response, error in
-            guard let self = self else { return }
-
-            guard error == nil, let httpResponse = response as? HTTPURLResponse else {
-                if let error = error {
-                    logger.debug("Freshness check error for \(safeFilename): \(error.localizedDescription)")
-                }
-                return
-            }
-
-            if httpResponse.statusCode == 304 {
-                logger.debug("Cache up-to-date: \(safeFilename)")
-                return
-            }
-
-            guard httpResponse.statusCode == 200, let data = data else {
-                logger.debug("Freshness check failed: HTTP \(httpResponse.statusCode) for \(safeFilename)")
-                return
-            }
-
-            guard data.count <= SoundtrackManager.maxFileSize else {
-                logger.debug("Updated file too large: \(data.count) bytes")
-                return
-            }
-
-            // Server has a newer version — write it
-            do {
-                let tempFile = self.cacheDir.appendingPathComponent(safeFilename + ".tmp")
-                try data.write(to: tempFile)
-                try FileManager.default.moveItem(at: tempFile, to: targetFile)
-                logger.info("Updated: \(safeFilename) (\(data.count) bytes)")
-            } catch {
-                do {
-                    try FileManager.default.removeItem(at: targetFile)
-                    try data.write(to: targetFile)
-                    logger.info("Updated (replaced): \(safeFilename) (\(data.count) bytes)")
-                } catch {
-                    logger.debug("Freshness check write error for \(safeFilename): \(error.localizedDescription)")
-                }
-            }
+        let code = httpResponse.statusCode
+        if job.freshnessOnly && code == 304 {
+            logger.debug("Cache up-to-date: \(job.safeFilename)")
+            return .done
         }
-        task.resume()
+        guard code == 200 else {
+            logger.warning("Download failed: HTTP \(code) for \(job.url.absoluteString)")
+            // Server trouble or throttling may pass; a 404 and the like won't
+            return (code >= 500 || code == 408 || code == 429) ? .retryableFailure : .permanentFailure
+        }
+        guard let tempURL = tempURL else {
+            logger.error("Download error for \(job.safeFilename): no file")
+            return .retryableFailure
+        }
+
+        let fm = FileManager.default
+        var fileSize: Int64 = 0
+        if let attrs = try? fm.attributesOfItem(atPath: tempURL.path),
+           let size = attrs[.size] as? Int64 {
+            fileSize = size
+        }
+        guard fileSize <= SoundtrackManager.maxFileSize else {
+            logger.warning("File too large: \(fileSize) bytes (max: \(SoundtrackManager.maxFileSize))")
+            return .permanentFailure
+        }
+
+        // Move it next to the target first (URLSession's temp dir may be on another volume), then into place
+        let tmpFile = cacheDir.appendingPathComponent(job.safeFilename + ".tmp")
+        do {
+            if fm.fileExists(atPath: tmpFile.path) {
+                try? fm.removeItem(at: tmpFile)
+            }
+            try fm.moveItem(at: tempURL, to: tmpFile)
+            if fm.fileExists(atPath: job.targetFile.path) {
+                try fm.removeItem(at: job.targetFile)
+            }
+            try fm.moveItem(at: tmpFile, to: job.targetFile)
+        } catch {
+            try? fm.removeItem(at: tmpFile)
+            logger.error("Cache move error for \(job.safeFilename): \(error.localizedDescription)")
+            return .permanentFailure
+        }
+
+        // Stamp the file with the server's Last-Modified: the next visit's If-Modified-Since sends it back,
+        // and nginx (if_modified_since exact, its default) answers 304 only to that exact date. With the
+        // download time instead, every cached file was downloaded again on every visit.
+        if let lastModified = httpResponse.value(forHTTPHeaderField: "Last-Modified"),
+           let serverDate = SoundtrackManager.httpDateFormatter.date(from: lastModified) {
+            // Best effort: without it the file still works, it's just re-fetched in full next time
+            try? fm.setAttributes([.modificationDate: serverDate], ofItemAtPath: job.targetFile.path)
+        }
+
+        logger.info("\(job.freshnessOnly ? "Updated" : "Cached"): \(job.safeFilename) (\(fileSize) bytes)")
+        if !job.freshnessOnly {
+            pruneCache()
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.updateCacheSize()
+        }
+        return .done
+    }
+
+    /// Frees the job's slot, schedules a retry if it earned one, and starts the next download.
+    /// Must be called on downloadStateQueue.
+    private func downloadFinished(job: DownloadJob, result: DownloadResult) {
+        dispatchPrecondition(condition: .onQueue(downloadStateQueue))
+        activeDownloads -= 1
+        // Only files we don't have are retried; a failed freshness check just leaves the cached copy in place
+        let retry = result == .retryableFailure && !job.freshnessOnly
+            && job.attempt < SoundtrackManager.retryDelaysSec.count
+        if retry {
+            retryWaiting[job.safeFilename] = job  // stays in queuedDownloads: still pending
+            let delaySec = SoundtrackManager.retryDelaysSec[job.attempt]
+            job.attempt += 1
+            logger.info("Will retry \(job.safeFilename) in \(delaySec)s (retry \(job.attempt) of \(SoundtrackManager.retryDelaysSec.count))")
+            downloadStateQueue.asyncAfter(deadline: .now() + .seconds(delaySec)) { [weak self] in
+                guard let self = self else { return }
+                // Gone already if a play pulled it forward
+                guard let waiting = self.retryWaiting[job.safeFilename], waiting === job else { return }
+                self.retryWaiting.removeValue(forKey: job.safeFilename)
+                self.missingQueue.append(job)
+                self.pumpDownloads()
+            }
+        } else {
+            queuedDownloads.remove(job.safeFilename)
+        }
+        pumpDownloads()
+    }
+
+    /// True while a file is waiting in the download queue, waiting for a retry, or downloading.
+    private func isDownloadPending(_ safeFilename: String) -> Bool {
+        return downloadStateQueue.sync { queuedDownloads.contains(safeFilename) }
+    }
+
+    /// A play wants a file that isn't cached: move it to the front of the download queue, or queue it
+    /// again if an earlier download of it failed. Returns true if it is now queued or downloading.
+    private func requestDownloadNow(_ safeFilename: String) -> Bool {
+        return downloadStateQueue.sync { () -> Bool in
+            if let idx = missingQueue.firstIndex(where: { $0.safeFilename == safeFilename }) {
+                let job = missingQueue.remove(at: idx)
+                missingQueue.insert(job, at: 0)
+                logger.info("Moved \(safeFilename) to the front of the download queue")
+                return true
+            }
+            if let idx = freshnessQueue.firstIndex(where: { $0.safeFilename == safeFilename }) {
+                // Its cached copy went (pruned) before its freshness check ran: fetch it in full, first
+                let old = freshnessQueue.remove(at: idx)
+                let job = DownloadJob(url: old.url, safeFilename: safeFilename,
+                                      targetFile: old.targetFile, freshnessOnly: false)
+                missingQueue.insert(job, at: 0)
+                logger.info("Moved \(safeFilename) to the front of the download queue (was a freshness check)")
+            } else if let waiting = retryWaiting.removeValue(forKey: safeFilename) {
+                missingQueue.insert(waiting, at: 0)  // a play wants it now: skip the rest of its back-off
+                logger.info("Retrying \(safeFilename) now (a play wants it)")
+            } else if queuedDownloads.contains(safeFilename) {
+                return true  // downloading right now
+            } else {
+                guard let url = urlByFilename[safeFilename] else { return false }  // never cached by the board
+                queuedDownloads.insert(safeFilename)
+                let job = DownloadJob(url: url, safeFilename: safeFilename,
+                                      targetFile: cacheDir.appendingPathComponent(safeFilename),
+                                      freshnessOnly: false)
+                missingQueue.insert(job, at: 0)
+                logger.info("Re-queued failed download at the front: \(safeFilename)")
+            }
+            pumpDownloads()
+            return true
+        }
     }
 
     // MARK: - Playback
@@ -374,48 +537,72 @@ class SoundtrackManager: ObservableObject {
         )
     }
 
+    /// Play a cached file on a channel. If it isn't cached yet (still queued or downloading),
+    /// it is pulled to the front of the download queue and played when it arrives.
+    /// Main thread only.
     private func play(filename: String, loop: Bool, channelIdx: Int) {
         guard let ch = getChannel(channelIdx) else { return }
+
+        // Any wait for an earlier play on this channel is now stale
+        ch.playGeneration += 1
+        let playGen = ch.playGeneration
 
         let resolved = displayNameMap[filename]
         if let resolved = resolved {
             logger.info("Resolved display name '\(filename)' -> '\(resolved)'")
         }
 
-        var safeFilename = sanitizeFilename(resolved ?? filename)
-        if safeFilename == nil {
-            safeFilename = findCachedFile(baseName: filename)
-            if safeFilename == nil {
-                logger.warning("No cached file found for: \(filename)")
-                return
-            }
+        var safeName = sanitizeFilename(resolved ?? filename)
+        if safeName == nil {
+            safeName = findCachedFile(baseName: filename)
         }
-
-        let file = cacheDir.appendingPathComponent(safeFilename!)
-
-        if !FileManager.default.fileExists(atPath: file.path) {
-            logger.info("File not cached yet, waiting: \(safeFilename!)")
-            let waitFilename = safeFilename!
-            let waitChannel = channelIdx
-            DispatchQueue.global().async { [weak self] in
-                for i in 0..<40 {
-                    Thread.sleep(forTimeInterval: 0.25)
-                    guard let self = self else { return }
-                    let waitFile = self.cacheDir.appendingPathComponent(waitFilename)
-                    if FileManager.default.fileExists(atPath: waitFile.path) {
-                        logger.info("File ready after \((i + 1) * 250)ms: \(waitFilename)")
-                        DispatchQueue.main.async {
-                            self.playInternal(file: waitFile, safeFilename: waitFilename, loop: loop, channelIdx: waitChannel)
-                        }
-                        return
-                    }
-                }
-                logger.warning("Timed out waiting for file: \(waitFilename)")
-            }
+        guard let safeFilename = safeName else {
+            logger.warning("No cached file found for: \(filename)")
             return
         }
 
-        playInternal(file: file, safeFilename: safeFilename!, loop: loop, channelIdx: channelIdx)
+        let file = cacheDir.appendingPathComponent(safeFilename)
+
+        if !FileManager.default.fileExists(atPath: file.path) {
+            let pending = requestDownloadNow(safeFilename)
+            let waitMs = pending ? SoundtrackManager.pendingPlayWaitMs : SoundtrackManager.unknownPlayWaitMs
+            logger.info("File not cached yet, waiting up to \(waitMs / 1000)s: \(safeFilename)\(pending ? "" : " (no download known for it)")")
+            waitAndPlay(file: file, safeFilename: safeFilename, loop: loop, channelIdx: channelIdx,
+                        playGen: playGen, waitMs: waitMs, pending: pending, elapsedMs: 0)
+            return
+        }
+
+        playInternal(file: file, safeFilename: safeFilename, loop: loop, channelIdx: channelIdx)
+    }
+
+    /// Polls for a file a play is waiting on, every 250ms on the main thread, until it arrives,
+    /// the channel gets a newer play/stop, its download fails, or waitMs runs out.
+    private func waitAndPlay(file: URL, safeFilename: String, loop: Bool, channelIdx: Int,
+                             playGen: Int, waitMs: Int, pending: Bool, elapsedMs: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+            guard let self = self, let ch = self.getChannel(channelIdx) else { return }
+            let elapsed = elapsedMs + 250
+            guard ch.playGeneration == playGen else {
+                logger.info("Dropped wait for \(safeFilename): ch\(channelIdx) got a newer play/stop")
+                return
+            }
+            if FileManager.default.fileExists(atPath: file.path) {
+                logger.info("File ready after \(elapsed)ms: \(safeFilename)")
+                self.playInternal(file: file, safeFilename: safeFilename, loop: loop, channelIdx: channelIdx)
+                return
+            }
+            // Its download failed while we waited: there is nothing left to wait for
+            if pending && !self.isDownloadPending(safeFilename) {
+                logger.warning("Gave up on \(safeFilename): its download failed")
+                return
+            }
+            guard elapsed < waitMs else {
+                logger.warning("Timed out waiting for file: \(safeFilename)")
+                return
+            }
+            self.waitAndPlay(file: file, safeFilename: safeFilename, loop: loop, channelIdx: channelIdx,
+                             playGen: playGen, waitMs: waitMs, pending: pending, elapsedMs: elapsed)
+        }
     }
 
     private func findCachedFile(baseName: String) -> String? {
@@ -613,6 +800,7 @@ class SoundtrackManager: ObservableObject {
 
     func stopAll() {
         for ch in channels {
+            ch.playGeneration += 1  // drops any play still waiting on a download
             ch.fadeTimer?.invalidate()
             ch.fadeTimer = nil
             ch.queue.removeAll()
@@ -626,6 +814,7 @@ class SoundtrackManager: ObservableObject {
 
     private func stopChannel(_ channelIdx: Int) {
         guard let ch = getChannel(channelIdx) else { return }
+        ch.playGeneration += 1  // drops any play still waiting on a download
         ch.fadeTimer?.invalidate()
         ch.fadeTimer = nil
         ch.queue.removeAll()
@@ -805,7 +994,7 @@ class SoundtrackManager: ObservableObject {
     private func pruneCache() {
         let limit = getCacheLimitBytes()
         guard let files = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]
+            at: cacheDir, includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey, .fileSizeKey]
         ) else { return }
 
         let validFiles = files.filter { !$0.lastPathComponent.hasSuffix(".tmp") }
@@ -817,11 +1006,14 @@ class SoundtrackManager: ObservableObject {
 
         let playingFiles = Set(channels.compactMap { $0.currentFilename })
 
-        let sorted = validFiles.sorted {
-            let d1 = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-            let d2 = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-            return d1 < d2
+        // Oldest download first. By creation date, not modification date: a downloaded file's
+        // modification date is the server's Last-Modified (see finishDownload), which can be years
+        // old and would get a file pruned straight after it was fetched.
+        func downloadedAt(_ url: URL) -> Date {
+            let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+            return values?.creationDate ?? values?.contentModificationDate ?? .distantPast
         }
+        let sorted = validFiles.sorted { downloadedAt($0) < downloadedAt($1) }
 
         for file in sorted {
             guard totalSize > limit else { break }
